@@ -8,13 +8,15 @@ the FastAPI application with all API endpoints.
 import asyncio
 import json
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 
+from hindsight_api.engine.audit import AuditEntry, AuditLogger
 from hindsight_api.extensions import AuthenticationError
 
 
@@ -747,7 +749,7 @@ class ReflectFact(BaseModel):
     text: str = Field(
         description="Fact text. When type='observation', this contains markdown-formatted consolidated knowledge"
     )
-    type: str | None = None  # fact type: world, experience, observation
+    type: str | None = None  # fact type: world, experience, opinion, observation
     context: str | None = None
     occurred_start: str | None = None
     occurred_end: str | None = None
@@ -1276,6 +1278,8 @@ class DocumentResponse(BaseModel):
                 "updated_at": "2024-01-15T10:30:00Z",
                 "memory_unit_count": 15,
                 "tags": ["user_a", "session_123"],
+                "document_metadata": {"source": "slack", "channel": "#general"},
+                "retain_params": {"context": "Team meeting notes", "event_date": "2024-01-15"},
             }
         }
     )
@@ -1288,6 +1292,8 @@ class DocumentResponse(BaseModel):
     updated_at: str
     memory_unit_count: int
     tags: list[str] = FieldWithDefault(list, description="Tags associated with this document")
+    document_metadata: dict[str, Any] | None = Field(default=None, description="Document metadata")
+    retain_params: dict[str, Any] | None = Field(default=None, description="Parameters used during retain")
 
 
 class UpdateDocumentRequest(BaseModel):
@@ -1497,6 +1503,23 @@ class MentalModelTrigger(BaseModel):
         default=None,
         description="Exclude specific mental models by ID from the reflect loop.",
     )
+    tags_match: TagsMatch | None = Field(
+        default=None,
+        description=(
+            "Override how the model's tags filter memories during refresh. "
+            "If not set, defaults to 'all_strict' when the model has tags (security isolation) "
+            "or 'any' when the model has no tags. "
+            "Set to 'any' to include untagged memories alongside tagged ones during refresh."
+        ),
+    )
+    tag_groups: list[TagGroup] | None = Field(
+        default=None,
+        description=(
+            "Compound boolean tag expressions to use during refresh instead of the model's own tags. "
+            "When set, these tag groups are passed to reflect and the model's flat tags are NOT used for filtering. "
+            "Supports nested and/or/not expressions for complex tag-based scoping."
+        ),
+    )
 
     @field_validator("fact_types")
     @classmethod
@@ -1512,13 +1535,14 @@ class MentalModelResponse(BaseModel):
     id: str
     bank_id: str
     name: str
-    source_query: str
-    content: str = Field(
-        description="The mental model content as well-formatted markdown (auto-generated from reflect endpoint)"
+    source_query: str | None = None
+    content: str | None = Field(
+        default=None,
+        description="The mental model content as well-formatted markdown (auto-generated from reflect endpoint)",
     )
     tags: list[str] = FieldWithDefault(list)
-    max_tokens: int = Field(default=2048)
-    trigger: MentalModelTrigger = FieldWithDefault(MentalModelTrigger)
+    max_tokens: int | None = Field(default=None)
+    trigger: MentalModelTrigger | None = Field(default=None)
     last_refreshed_at: str | None = None
     created_at: str | None = None
     reflect_response: dict | None = Field(
@@ -1586,6 +1610,186 @@ class UpdateMentalModelRequest(BaseModel):
     max_tokens: int | None = Field(default=None, ge=256, le=8192, description="Maximum tokens for generated content")
     tags: list[str] | None = Field(default=None, description="Tags for scoped visibility")
     trigger: MentalModelTrigger | None = Field(default=None, description="Trigger settings")
+
+
+# =========================================================================
+# Bank Templates (import/export)
+# =========================================================================
+
+# Current manifest schema version. Bump when making breaking changes.
+BANK_TEMPLATE_CURRENT_VERSION = "1"
+
+
+class BankTemplateMentalModel(BaseModel):
+    """A mental model definition within a bank template manifest."""
+
+    id: str = Field(description="Unique ID for the mental model (alphanumeric lowercase with hyphens)")
+    name: str = Field(description="Human-readable name for the mental model")
+    source_query: str = Field(description="The query to run to generate content")
+    tags: list[str] = FieldWithDefault(list, description="Tags for scoped visibility")
+    max_tokens: int = Field(default=2048, ge=256, le=8192, description="Maximum tokens for generated content")
+    trigger: MentalModelTrigger = FieldWithDefault(MentalModelTrigger, description="Trigger settings")
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        if not re.match(r"^[a-z0-9][a-z0-9-]*$", v):
+            raise ValueError(
+                f"Mental model id '{v}' must be alphanumeric lowercase with hyphens, starting with a letter or digit."
+            )
+        return v
+
+
+class BankTemplateConfig(BaseModel):
+    """Bank configuration fields within a template manifest.
+
+    Only includes configurable (per-bank) fields. Credential fields
+    (API keys, base URLs) are intentionally excluded for security.
+    """
+
+    reflect_mission: str | None = Field(default=None, description="Mission/context for Reflect operations")
+    retain_mission: str | None = Field(default=None, description="Steers what gets extracted during retain")
+    retain_extraction_mode: str | None = Field(
+        default=None, description="Fact extraction mode: 'concise' (default), 'verbose', or 'custom'"
+    )
+    retain_custom_instructions: str | None = Field(
+        default=None, description="Custom extraction prompt (when mode='custom')"
+    )
+    retain_chunk_size: int | None = Field(default=None, description="Max token size for each content chunk")
+    enable_observations: bool | None = Field(default=None, description="Toggle observation consolidation")
+    observations_mission: str | None = Field(default=None, description="Controls what gets synthesised")
+    disposition_skepticism: int | None = Field(default=None, ge=1, le=5, description="Skepticism trait (1-5)")
+    disposition_literalism: int | None = Field(default=None, ge=1, le=5, description="Literalism trait (1-5)")
+    disposition_empathy: int | None = Field(default=None, ge=1, le=5, description="Empathy trait (1-5)")
+    entity_labels: list[str] | None = Field(default=None, description="Controlled vocabulary for entity labels")
+    entities_allow_free_form: bool | None = Field(
+        default=None, description="Allow entities outside the label vocabulary"
+    )
+
+    def get_config_updates(self) -> dict[str, Any]:
+        """Return only the fields that were explicitly set (non-None)."""
+        return {k: v for k, v in self.model_dump().items() if v is not None}
+
+
+class BankTemplateDirective(BaseModel):
+    """A directive definition within a bank template manifest.
+
+    Directives are matched by name on re-import: existing directives
+    with the same name are updated, new ones are created.
+    """
+
+    name: str = Field(description="Human-readable name for the directive (used as match key on re-import)")
+    content: str = Field(description="The directive text to inject into prompts")
+    priority: int = Field(default=0, description="Higher priority directives are injected first")
+    is_active: bool = Field(default=True, description="Whether this directive is active")
+    tags: list[str] = FieldWithDefault(list, description="Tags for filtering")
+
+
+class BankTemplateManifest(BaseModel):
+    """A bank template manifest for import/export.
+
+    Version field enables forward-compatible schema evolution: the API
+    auto-upgrades older manifest versions to the current schema on import.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "version": "1",
+                "bank": {
+                    "reflect_mission": "You are helping a support agent remember customer interactions.",
+                    "retain_mission": "Extract customer issues, resolutions, and sentiment.",
+                    "disposition_empathy": 5,
+                    "enable_observations": True,
+                },
+                "mental_models": [
+                    {
+                        "id": "sentiment-overview",
+                        "name": "Customer Sentiment Overview",
+                        "source_query": "What is the overall sentiment trend?",
+                        "trigger": {"refresh_after_consolidation": True},
+                    }
+                ],
+                "directives": [
+                    {
+                        "name": "Always be empathetic",
+                        "content": "Always respond with empathy and understanding.",
+                        "priority": 10,
+                    }
+                ],
+            }
+        }
+    )
+
+    version: str = Field(description="Manifest schema version (currently '1')")
+    bank: BankTemplateConfig | None = Field(
+        default=None, description="Bank configuration to apply. Omit to leave config unchanged."
+    )
+    mental_models: list[BankTemplateMentalModel] | None = Field(
+        default=None, description="Mental models to create or update (matched by id). Omit to leave unchanged."
+    )
+    directives: list[BankTemplateDirective] | None = Field(
+        default=None, description="Directives to create or update (matched by name). Omit to leave unchanged."
+    )
+
+    @field_validator("version")
+    @classmethod
+    def validate_version(cls, v: str) -> str:
+        try:
+            ver = int(v)
+        except ValueError:
+            raise ValueError(f"version must be a numeric string, got '{v}'")
+        if ver < 1:
+            raise ValueError("version must be >= 1")
+        if ver > int(BANK_TEMPLATE_CURRENT_VERSION):
+            raise ValueError(
+                f"version '{v}' is not supported by this server "
+                f"(max supported: {BANK_TEMPLATE_CURRENT_VERSION}). Please upgrade Hindsight."
+            )
+        return v
+
+    @field_validator("mental_models")
+    @classmethod
+    def validate_unique_mental_model_ids(
+        cls,
+        v: list[BankTemplateMentalModel] | None,
+    ) -> list[BankTemplateMentalModel] | None:
+        if v is None:
+            return v
+        ids = [m.id for m in v]
+        duplicates = [mid for mid in ids if ids.count(mid) > 1]
+        if duplicates:
+            raise ValueError(f"Duplicate mental model ids: {sorted(set(duplicates))}")
+        return v
+
+    @field_validator("directives")
+    @classmethod
+    def validate_unique_directive_names(
+        cls,
+        v: list[BankTemplateDirective] | None,
+    ) -> list[BankTemplateDirective] | None:
+        if v is None:
+            return v
+        names = [d.name for d in v]
+        duplicates = [n for n in names if names.count(n) > 1]
+        if duplicates:
+            raise ValueError(f"Duplicate directive names: {sorted(set(duplicates))}")
+        return v
+
+
+class BankTemplateImportResponse(BaseModel):
+    """Response model for the bank template import endpoint."""
+
+    bank_id: str = Field(description="Bank that was imported into")
+    config_applied: bool = Field(description="Whether bank config was updated")
+    mental_models_created: list[str] = FieldWithDefault(list, description="IDs of newly created mental models")
+    mental_models_updated: list[str] = FieldWithDefault(list, description="IDs of updated mental models")
+    directives_created: list[str] = FieldWithDefault(list, description="Names of newly created directives")
+    directives_updated: list[str] = FieldWithDefault(list, description="Names of updated directives")
+    operation_ids: list[str] = FieldWithDefault(
+        list, description="Operation IDs for mental model content generation (async)"
+    )
+    dry_run: bool = Field(default=False, description="True if this was a validation-only run")
 
 
 class OperationResponse(BaseModel):
@@ -1895,6 +2099,73 @@ class WebhookDeliveryListResponse(BaseModel):
     next_cursor: str | None = None
 
 
+def _make_audited_http(audit_logger_getter: Callable[[], AuditLogger | None]):
+    """Create an audit decorator bound to an audit logger getter.
+
+    Returns a decorator factory that can be used as @audited("action_name").
+    """
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+    from functools import wraps
+    from typing import Callable as _Callable
+
+    def audited(action: str, *, request_param: str | None = "request"):
+        """Decorator that wraps an HTTP handler with audit logging.
+
+        Args:
+            action: The audit action name (e.g. "retain", "recall").
+            request_param: Name of the kwarg holding the Pydantic request model
+                           (None if handler has no request body). Also supports "body".
+        """
+
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(*args, **kwargs):
+                al = audit_logger_getter()
+                if al is None or not al.is_enabled(action):
+                    return await func(*args, **kwargs)
+
+                bank_id = kwargs.get("bank_id")
+                started_at = _dt.now(_tz.utc)
+
+                req_data = None
+                if request_param:
+                    req_obj = kwargs.get(request_param)
+                    if req_obj is not None and hasattr(req_obj, "model_dump"):
+                        req_data = req_obj.model_dump(mode="json")
+                    elif req_obj is not None and isinstance(req_obj, dict):
+                        req_data = req_obj
+
+                entry = AuditEntry(
+                    action=action,
+                    transport="http",
+                    bank_id=bank_id,
+                    started_at=started_at,
+                    request=req_data,
+                )
+
+                try:
+                    result = await func(*args, **kwargs)
+                    if hasattr(result, "model_dump"):
+                        entry.response = result.model_dump(mode="json")
+                    elif isinstance(result, dict):
+                        entry.response = result
+                    return result
+                finally:
+                    entry.ended_at = _dt.now(_tz.utc)
+                    al.log_fire_and_forget(entry)
+
+            # Preserve FastAPI's dependency injection signature
+            import inspect
+
+            wrapper.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
+            return wrapper
+
+        return decorator
+
+    return audited
+
+
 def create_app(
     memory: MemoryEngine,
     initialize_memory: bool = True,
@@ -2063,6 +2334,98 @@ def create_app(
     # IMPORTANT: Set memory on app.state immediately, don't wait for lifespan
     # This is required for mounted sub-applications where lifespan may not fire
     app.state.memory = memory
+    app.state.audit_logger = memory.audit_logger
+
+    # ---------------------------------------------------------------------------
+    # Patch OpenAPI schema: align ValidationError with Pydantic v2 error format
+    # ---------------------------------------------------------------------------
+    # FastAPI auto-generates ValidationError with only loc/msg/type, but Pydantic
+    # v2 actually returns additional fields: input (the rejected value), ctx (extra
+    # context dict), and url (link to error docs). Without these in the spec,
+    # generated clients using strict JSON decoding break on real 422 responses.
+    _original_openapi = app.openapi
+
+    def _patched_openapi() -> dict[str, Any]:
+        schema = _original_openapi()
+        ve = schema.get("components", {}).get("schemas", {}).get("ValidationError")
+        if ve and "input" not in ve.get("properties", {}):
+            ve["properties"]["input"] = {"title": "Input"}
+            ve["properties"]["ctx"] = {"title": "Context", "type": "object"}
+            ve["properties"]["url"] = {"title": "URL", "type": "string"}
+        return schema
+
+    app.openapi = _patched_openapi  # type: ignore[assignment]
+
+    # Add unknown parameters detection middleware
+    @app.middleware("http")
+    async def unknown_params_middleware(request, call_next):
+        """Detect unknown query params and body fields, log warning and set response header."""
+        import inspect
+
+        from starlette.routing import Match
+
+        ignored_params: list[str] = []
+
+        # --- Query parameters ---
+        if request.query_params:
+            for route in app.routes:
+                match, _ = route.matches(request.scope)
+                if match == Match.FULL:
+                    endpoint = getattr(route, "endpoint", None)
+                    if endpoint:
+                        sig = inspect.signature(endpoint)
+                        declared = set(sig.parameters.keys())
+                        path_params = set(getattr(route, "param_convertors", {}).keys()) | set(
+                            request.path_params.keys()
+                        )
+                        known_query = declared - path_params
+                        for name in request.query_params:
+                            if name not in known_query and name not in path_params:
+                                ignored_params.append(name)
+                    break
+
+        # --- Body fields ---
+        body_ignored: list[str] = []
+        content_type = request.headers.get("content-type", "")
+        if request.method in ("POST", "PUT", "PATCH") and "application/json" in content_type:
+            try:
+                body_bytes = await request.body()
+                if body_bytes:
+                    body_json = json.loads(body_bytes)
+                    if isinstance(body_json, dict):
+                        for route in app.routes:
+                            match, _ = route.matches(request.scope)
+                            if match == Match.FULL:
+                                endpoint = getattr(route, "endpoint", None)
+                                if endpoint:
+                                    sig = inspect.signature(endpoint)
+                                    for param in sig.parameters.values():
+                                        ann = param.annotation
+                                        if isinstance(ann, type) and issubclass(ann, BaseModel):
+                                            known_fields = set(ann.model_fields.keys())
+                                            for key in body_json:
+                                                if key not in known_fields:
+                                                    body_ignored.append(key)
+                                            break
+                                break
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+        all_ignored = ignored_params + body_ignored
+
+        response = await call_next(request)
+
+        if all_ignored:
+            ignored_str = ", ".join(all_ignored)
+            logger.warning(
+                "Unknown parameters ignored: [%s] for %s %s",
+                ignored_str,
+                request.method,
+                request.url.path,
+            )
+            response.headers["X-Ignored-Params"] = ignored_str
+
+        return response
 
     # Add HTTP metrics middleware
     @app.middleware("http")
@@ -2108,6 +2471,9 @@ def create_app(
 
 def _register_routes(app: FastAPI):
     """Register all API routes on the given app instance."""
+
+    # Create audit decorator bound to this app's audit logger
+    audited = _make_audited_http(lambda: getattr(app.state, "audit_logger", None))
 
     def get_request_context(authorization: str | None = Header(default=None)) -> RequestContext:
         """
@@ -2364,6 +2730,7 @@ def _register_routes(app: FastAPI):
         operation_id="recall_memories",
         tags=["Memory"],
     )
+    @audited("recall")
     async def api_recall(
         bank_id: str, request: RecallRequest, request_context: RequestContext = Depends(get_request_context)
     ):
@@ -2452,6 +2819,7 @@ def _register_routes(app: FastAPI):
                     occurred_end=fact.occurred_end,
                     mentioned_at=fact.mentioned_at,
                     document_id=fact.document_id,
+                    metadata=fact.metadata,
                     chunk_id=fact.chunk_id,
                     tags=fact.tags,
                     source_fact_ids=fact.source_fact_ids,
@@ -2550,6 +2918,7 @@ def _register_routes(app: FastAPI):
         operation_id="reflect",
         tags=["Memory"],
     )
+    @audited("reflect")
     async def api_reflect(
         bank_id: str, request: ReflectRequest, request_context: RequestContext = Depends(get_request_context)
     ):
@@ -2854,6 +3223,10 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         tags_filter: list[str] | None = Query(None, alias="tags", description="Filter by tags"),
         tags_match: Literal["any", "all", "exact"] = Query("any", description="How to match tags"),
+        detail: Literal["metadata", "content", "full"] = Query(
+            "full",
+            description="Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)",
+        ),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         request_context: RequestContext = Depends(get_request_context),
@@ -2864,6 +3237,7 @@ def _register_routes(app: FastAPI):
                 bank_id=bank_id,
                 tags=tags_filter,
                 tags_match=tags_match,
+                detail=detail,
                 limit=limit,
                 offset=offset,
                 request_context=request_context,
@@ -2891,6 +3265,10 @@ def _register_routes(app: FastAPI):
     async def api_get_mental_model(
         bank_id: str,
         mental_model_id: str,
+        detail: Literal["metadata", "content", "full"] = Query(
+            "full",
+            description="Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)",
+        ),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Get a mental model by ID."""
@@ -2898,6 +3276,7 @@ def _register_routes(app: FastAPI):
             mental_model = await app.state.memory.get_mental_model(
                 bank_id=bank_id,
                 mental_model_id=mental_model_id,
+                detail=detail,
                 request_context=request_context,
             )
             if mental_model is None:
@@ -2960,6 +3339,7 @@ def _register_routes(app: FastAPI):
         operation_id="create_mental_model",
         tags=["Mental Models"],
     )
+    @audited("create_mental_model", request_param="body")
     async def api_create_mental_model(
         bank_id: str,
         body: CreateMentalModelRequest,
@@ -3007,6 +3387,7 @@ def _register_routes(app: FastAPI):
         operation_id="refresh_mental_model",
         tags=["Mental Models"],
     )
+    @audited("refresh_mental_model", request_param=None)
     async def api_refresh_mental_model(
         bank_id: str,
         mental_model_id: str,
@@ -3045,6 +3426,7 @@ def _register_routes(app: FastAPI):
         operation_id="update_mental_model",
         tags=["Mental Models"],
     )
+    @audited("update_mental_model", request_param="body")
     async def api_update_mental_model(
         bank_id: str,
         mental_model_id: str,
@@ -3084,6 +3466,7 @@ def _register_routes(app: FastAPI):
         operation_id="delete_mental_model",
         tags=["Mental Models"],
     )
+    @audited("delete_mental_model", request_param=None)
     async def api_delete_mental_model(
         bank_id: str,
         mental_model_id: str,
@@ -3196,6 +3579,7 @@ def _register_routes(app: FastAPI):
         operation_id="create_directive",
         tags=["Directives"],
     )
+    @audited("create_directive", request_param="body")
     async def api_create_directive(
         bank_id: str,
         body: CreateDirectiveRequest,
@@ -3234,6 +3618,7 @@ def _register_routes(app: FastAPI):
         operation_id="update_directive",
         tags=["Directives"],
     )
+    @audited("update_directive", request_param="body")
     async def api_update_directive(
         bank_id: str,
         directive_id: str,
@@ -3273,6 +3658,7 @@ def _register_routes(app: FastAPI):
         operation_id="delete_directive",
         tags=["Directives"],
     )
+    @audited("delete_directive", request_param=None)
     async def api_delete_directive(
         bank_id: str,
         directive_id: str,
@@ -3485,6 +3871,7 @@ def _register_routes(app: FastAPI):
         operation_id="update_document",
         tags=["Documents"],
     )
+    @audited("update_document", request_param="body")
     async def api_update_document(
         bank_id: str,
         document_id: str,
@@ -3535,6 +3922,7 @@ def _register_routes(app: FastAPI):
         operation_id="delete_document",
         tags=["Documents"],
     )
+    @audited("delete_document", request_param=None)
     async def api_delete_document(
         bank_id: str, document_id: str, request_context: RequestContext = Depends(get_request_context)
     ):
@@ -3651,6 +4039,7 @@ def _register_routes(app: FastAPI):
         operation_id="cancel_operation",
         tags=["Operations"],
     )
+    @audited("cancel_operation", request_param=None)
     async def api_cancel_operation(
         bank_id: str, operation_id: str, request_context: RequestContext = Depends(get_request_context)
     ):
@@ -3685,6 +4074,7 @@ def _register_routes(app: FastAPI):
         operation_id="retry_operation",
         tags=["Operations"],
     )
+    @audited("retry_operation", request_param=None)
     async def api_retry_operation(
         bank_id: str, operation_id: str, request_context: RequestContext = Depends(get_request_context)
     ):
@@ -3831,6 +4221,7 @@ def _register_routes(app: FastAPI):
         operation_id="create_or_update_bank",
         tags=["Banks"],
     )
+    @audited("create_bank")
     async def api_create_or_update_bank(
         bank_id: str, request: CreateBankRequest, request_context: RequestContext = Depends(get_request_context)
     ):
@@ -3886,6 +4277,7 @@ def _register_routes(app: FastAPI):
         operation_id="update_bank",
         tags=["Banks"],
     )
+    @audited("update_bank")
     async def api_update_bank(
         bank_id: str, request: CreateBankRequest, request_context: RequestContext = Depends(get_request_context)
     ):
@@ -3942,6 +4334,7 @@ def _register_routes(app: FastAPI):
         operation_id="delete_bank",
         tags=["Banks"],
     )
+    @audited("delete_bank", request_param=None)
     async def api_delete_bank(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
         """Delete an entire memory bank and all its data."""
         try:
@@ -3964,6 +4357,304 @@ def _register_routes(app: FastAPI):
             logger.error(f"Error in DELETE /v1/default/banks/{bank_id}: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    # =====================================================================
+    # Bank Template Import / Export
+    # =====================================================================
+
+    def _validate_template(manifest: BankTemplateManifest) -> list[str]:
+        """Validate a parsed manifest beyond Pydantic's structural checks.
+
+        Returns a list of human-readable error strings (e.g. invalid
+        extraction mode values, conflicting settings).
+        """
+        errors: list[str] = []
+        if manifest.bank:
+            bank = manifest.bank
+            if bank.retain_extraction_mode is not None:
+                valid_modes = ("concise", "verbose", "custom", "chunks")
+                if bank.retain_extraction_mode not in valid_modes:
+                    errors.append(
+                        f"bank.retain_extraction_mode: must be one of {valid_modes}, "
+                        f"got '{bank.retain_extraction_mode}'"
+                    )
+            if bank.retain_custom_instructions and bank.retain_extraction_mode != "custom":
+                errors.append("bank.retain_custom_instructions: requires retain_extraction_mode='custom'")
+        if manifest.mental_models:
+            for i, mm in enumerate(manifest.mental_models):
+                if not mm.name.strip():
+                    errors.append(f"mental_models[{i}].name: must not be empty")
+                if not mm.source_query.strip():
+                    errors.append(f"mental_models[{i}].source_query: must not be empty")
+        if manifest.directives:
+            for i, d in enumerate(manifest.directives):
+                if not d.name.strip():
+                    errors.append(f"directives[{i}].name: must not be empty")
+                if not d.content.strip():
+                    errors.append(f"directives[{i}].content: must not be empty")
+        return errors
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/import",
+        response_model=BankTemplateImportResponse,
+        summary="Import bank template",
+        description="Import a bank template manifest to create or update a bank's configuration, mental models, "
+        "and directives. If the bank does not exist it is created. Config fields are applied as per-bank overrides. "
+        "Mental models are matched by id, directives by name — existing ones are updated, new ones are created. "
+        "Use dry_run=true to validate the manifest without applying changes.",
+        operation_id="import_bank_template",
+        tags=["Bank Templates"],
+    )
+    @audited("import_bank_template", request_param=None)
+    async def api_import_bank_template(
+        bank_id: str,
+        request: Request,
+        dry_run: bool = Query(default=False, description="Validate only, do not apply changes"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Import a bank template manifest."""
+        try:
+            # Parse raw JSON and validate against the Pydantic model manually
+            # so we can return clean error messages instead of raw 422s.
+            raw_body = await request.json()
+            from pydantic import ValidationError
+
+            try:
+                body = BankTemplateManifest.model_validate(raw_body)
+            except ValidationError as e:
+                errors = [f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}" for err in e.errors()]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Template schema validation failed: {'; '.join(errors)}",
+                )
+
+            # Semantic validation beyond Pydantic structural checks
+            validation_errors = _validate_template(body)
+            if validation_errors:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Template validation failed: {'; '.join(validation_errors)}",
+                )
+            if dry_run:
+                return BankTemplateImportResponse(
+                    bank_id=bank_id,
+                    config_applied=body.bank is not None,
+                    mental_models_created=[m.id for m in (body.mental_models or [])],
+                    directives_created=[d.name for d in (body.directives or [])],
+                    dry_run=True,
+                )
+
+            # Ensure bank exists (auto-creates with defaults if needed)
+            await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+
+            config_applied = False
+            if body.bank:
+                config_updates = body.bank.get_config_updates()
+                if config_updates:
+                    await app.state.memory._config_resolver.update_bank_config(bank_id, config_updates, request_context)
+                    config_applied = True
+
+            created_ids: list[str] = []
+            updated_ids: list[str] = []
+            operation_ids: list[str] = []
+
+            if body.mental_models:
+                # Fetch existing mental models to decide create vs update
+                existing = await app.state.memory.list_mental_models(bank_id=bank_id, request_context=request_context)
+                existing_by_id = {m["id"]: m for m in existing}
+
+                for mm in body.mental_models:
+                    if mm.id in existing_by_id:
+                        # Update existing mental model metadata
+                        await app.state.memory.update_mental_model(
+                            bank_id=bank_id,
+                            mental_model_id=mm.id,
+                            name=mm.name,
+                            source_query=mm.source_query,
+                            max_tokens=mm.max_tokens,
+                            tags=mm.tags if mm.tags else None,
+                            trigger=mm.trigger.model_dump() if mm.trigger else None,
+                            request_context=request_context,
+                        )
+                        # Schedule a refresh to regenerate content with updated query
+                        result = await app.state.memory.submit_async_refresh_mental_model(
+                            bank_id=bank_id,
+                            mental_model_id=mm.id,
+                            request_context=request_context,
+                        )
+                        operation_ids.append(result["operation_id"])
+                        updated_ids.append(mm.id)
+                    else:
+                        # Create new mental model
+                        mental_model = await app.state.memory.create_mental_model(
+                            bank_id=bank_id,
+                            name=mm.name,
+                            source_query=mm.source_query,
+                            content="Generating content...",
+                            mental_model_id=mm.id,
+                            tags=mm.tags if mm.tags else None,
+                            max_tokens=mm.max_tokens,
+                            trigger=mm.trigger.model_dump() if mm.trigger else None,
+                            request_context=request_context,
+                        )
+                        result = await app.state.memory.submit_async_refresh_mental_model(
+                            bank_id=bank_id,
+                            mental_model_id=mental_model["id"],
+                            request_context=request_context,
+                        )
+                        operation_ids.append(result["operation_id"])
+                        created_ids.append(mm.id)
+
+            directives_created: list[str] = []
+            directives_updated: list[str] = []
+
+            if body.directives:
+                # Fetch existing directives to decide create vs update (matched by name)
+                existing_directives = await app.state.memory.list_directives(
+                    bank_id=bank_id, active_only=False, request_context=request_context
+                )
+                existing_by_name = {d["name"]: d for d in existing_directives}
+
+                for directive in body.directives:
+                    if directive.name in existing_by_name:
+                        await app.state.memory.update_directive(
+                            bank_id=bank_id,
+                            directive_id=existing_by_name[directive.name]["id"],
+                            content=directive.content,
+                            priority=directive.priority,
+                            is_active=directive.is_active,
+                            tags=directive.tags if directive.tags else None,
+                            request_context=request_context,
+                        )
+                        directives_updated.append(directive.name)
+                    else:
+                        await app.state.memory.create_directive(
+                            bank_id=bank_id,
+                            name=directive.name,
+                            content=directive.content,
+                            priority=directive.priority,
+                            is_active=directive.is_active,
+                            tags=directive.tags if directive.tags else None,
+                            request_context=request_context,
+                        )
+                        directives_created.append(directive.name)
+
+            return BankTemplateImportResponse(
+                bank_id=bank_id,
+                config_applied=config_applied,
+                mental_models_created=created_ids,
+                mental_models_updated=updated_ids,
+                directives_created=directives_created,
+                directives_updated=directives_updated,
+                operation_ids=operation_ids,
+                dry_run=False,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in POST /v1/default/banks/{bank_id}/import: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/export",
+        response_model=BankTemplateManifest,
+        summary="Export bank template",
+        description="Export a bank's current configuration, mental models, and directives as a template manifest. "
+        "The exported manifest can be imported into another bank to replicate the setup.",
+        operation_id="export_bank_template",
+        tags=["Bank Templates"],
+    )
+    async def api_export_bank_template(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Export a bank's config and mental models as a template manifest."""
+        try:
+            # Authenticate and ensure bank exists
+            profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            if profile is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
+
+            # Get bank-specific config overrides (not the fully resolved config,
+            # so the template only contains what was explicitly set on this bank)
+            await app.state.memory._authenticate_tenant(request_context)
+            bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
+
+            # Filter to only BankTemplateConfig fields (exclude credentials, static fields)
+            template_config_fields = set(BankTemplateConfig.model_fields.keys())
+            filtered_overrides = {k: v for k, v in bank_overrides.items() if k in template_config_fields}
+            bank_config = BankTemplateConfig(**filtered_overrides) if filtered_overrides else None
+
+            # Get mental models
+            mental_models_raw = await app.state.memory.list_mental_models(
+                bank_id=bank_id, request_context=request_context
+            )
+            template_mental_models: list[BankTemplateMentalModel] = []
+            for mm in mental_models_raw:
+                trigger_data = mm.get("trigger", {})
+                trigger = MentalModelTrigger(**trigger_data) if trigger_data else MentalModelTrigger()
+                template_mental_models.append(
+                    BankTemplateMentalModel(
+                        id=mm["id"],
+                        name=mm["name"],
+                        source_query=mm["source_query"],
+                        tags=mm.get("tags", []),
+                        max_tokens=mm.get("max_tokens", 2048),
+                        trigger=trigger,
+                    )
+                )
+
+            # Get directives
+            directives_raw = await app.state.memory.list_directives(
+                bank_id=bank_id, active_only=False, request_context=request_context
+            )
+            template_directives: list[BankTemplateDirective] = []
+            for d in directives_raw:
+                template_directives.append(
+                    BankTemplateDirective(
+                        name=d["name"],
+                        content=d["content"],
+                        priority=d.get("priority", 0),
+                        is_active=d.get("is_active", True),
+                        tags=d.get("tags", []),
+                    )
+                )
+
+            return BankTemplateManifest(
+                version=BANK_TEMPLATE_CURRENT_VERSION,
+                bank=bank_config,
+                mental_models=template_mental_models if template_mental_models else None,
+                directives=template_directives if template_directives else None,
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in GET /v1/default/banks/{bank_id}/export: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/bank-template-schema",
+        summary="Get bank template JSON Schema",
+        description="Returns the JSON Schema for the bank template manifest format. "
+        "Use this to validate template manifests before importing.",
+        operation_id="get_bank_template_schema",
+        tags=["Bank Templates"],
+    )
+    async def api_get_bank_template_schema():
+        """Return the JSON Schema for the bank template manifest."""
+        return BankTemplateManifest.model_json_schema()
+
     @app.delete(
         "/v1/default/banks/{bank_id}/observations",
         response_model=DeleteResponse,
@@ -3972,6 +4663,7 @@ def _register_routes(app: FastAPI):
         operation_id="clear_observations",
         tags=["Banks"],
     )
+    @audited("clear_observations", request_param=None)
     async def api_clear_observations(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
         """Clear all observations for a bank."""
         try:
@@ -4004,6 +4696,7 @@ def _register_routes(app: FastAPI):
         operation_id="recover_consolidation",
         tags=["Banks"],
     )
+    @audited("recover_consolidation", request_param=None)
     async def api_recover_consolidation(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
         """Reset consolidation-failed memories for recovery."""
         try:
@@ -4030,6 +4723,7 @@ def _register_routes(app: FastAPI):
         operation_id="clear_memory_observations",
         tags=["Memory"],
     )
+    @audited("clear_memory_observations", request_param=None)
     async def api_clear_memory_observations(
         bank_id: str,
         memory_id: str,
@@ -4110,6 +4804,7 @@ def _register_routes(app: FastAPI):
         operation_id="update_bank_config",
         tags=["Banks"],
     )
+    @audited("update_bank_config")
     async def api_update_bank_config(
         bank_id: str, request: BankConfigUpdate, request_context: RequestContext = Depends(get_request_context)
     ):
@@ -4161,6 +4856,7 @@ def _register_routes(app: FastAPI):
         operation_id="reset_bank_config",
         tags=["Banks"],
     )
+    @audited("reset_bank_config", request_param=None)
     async def api_reset_bank_config(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
         """Reset bank configuration to defaults (remove all overrides)."""
         if not get_config().enable_bank_config_api:
@@ -4206,6 +4902,7 @@ def _register_routes(app: FastAPI):
         operation_id="trigger_consolidation",
         tags=["Banks"],
     )
+    @audited("consolidation", request_param=None)
     async def api_trigger_consolidation(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
         """Trigger consolidation for a bank (async)."""
         try:
@@ -4238,6 +4935,7 @@ def _register_routes(app: FastAPI):
         tags=["Webhooks"],
         status_code=201,
     )
+    @audited("create_webhook")
     async def api_create_webhook(
         bank_id: str,
         request: CreateWebhookRequest,
@@ -4354,6 +5052,7 @@ def _register_routes(app: FastAPI):
         operation_id="delete_webhook",
         tags=["Webhooks"],
     )
+    @audited("delete_webhook", request_param=None)
     async def api_delete_webhook(
         bank_id: str,
         webhook_id: str,
@@ -4390,6 +5089,7 @@ def _register_routes(app: FastAPI):
         operation_id="update_webhook",
         tags=["Webhooks"],
     )
+    @audited("update_webhook")
     async def api_update_webhook(
         bank_id: str,
         webhook_id: str,
@@ -4566,6 +5266,7 @@ def _register_routes(app: FastAPI):
         operation_id="retain_memories",
         tags=["Memory"],
     )
+    @audited("retain")
     async def api_retain(
         bank_id: str, request: RetainRequest, request_context: RequestContext = Depends(get_request_context)
     ):
@@ -4729,6 +5430,7 @@ def _register_routes(app: FastAPI):
         operation_id="file_retain",
         tags=["Files"],
     )
+    @audited("file_retain", request_param=None)
     async def api_file_retain(
         bank_id: str,
         files: list[UploadFile] = File(..., description="Files to upload and convert"),
@@ -4878,6 +5580,7 @@ def _register_routes(app: FastAPI):
         operation_id="clear_bank_memories",
         tags=["Memory"],
     )
+    @audited("clear_memories", request_param=None)
     async def api_clear_bank_memories(
         bank_id: str,
         type: str | None = Query(None, description="Optional fact type filter (world, experience, opinion)"),
@@ -4885,7 +5588,9 @@ def _register_routes(app: FastAPI):
     ):
         """Clear memories for a memory bank, optionally filtered by type."""
         try:
-            await app.state.memory.delete_bank(bank_id, fact_type=type, request_context=request_context)
+            await app.state.memory.delete_bank(
+                bank_id, fact_type=type, delete_bank_profile=False, request_context=request_context
+            )
 
             return DeleteResponse(success=True)
         except OperationValidationError as e:
@@ -4897,4 +5602,252 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in /v1/default/banks/{bank_id}/memories: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ---- Audit Logs ----
+
+    class AuditLogEntry(BaseModel):
+        """A single audit log entry."""
+
+        id: str
+        action: str
+        transport: str
+        bank_id: str | None
+        started_at: str | None
+        ended_at: str | None
+        duration_ms: int | None = Field(
+            default=None,
+            description="Server-computed duration in milliseconds (started_at → ended_at). Null if not yet completed.",
+        )
+        request: dict[str, Any] | None
+        response: dict[str, Any] | None
+        metadata: dict[str, Any]
+
+    class AuditLogListResponse(BaseModel):
+        """Response model for list audit logs endpoint."""
+
+        bank_id: str
+        total: int
+        limit: int
+        offset: int
+        items: list[AuditLogEntry]
+
+    class AuditLogStatsBucket(BaseModel):
+        """A single time bucket in audit log stats."""
+
+        time: str
+        actions: dict[str, int]
+        total: int
+
+    class AuditLogStatsResponse(BaseModel):
+        """Response model for audit log stats endpoint."""
+
+        bank_id: str
+        period: str
+        trunc: str
+        start: str
+        buckets: list[AuditLogStatsBucket]
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/audit-logs",
+        summary="List audit logs",
+        description="List audit log entries for a bank, ordered by most recent first.",
+        operation_id="list_audit_logs",
+        tags=["Audit"],
+        response_model=AuditLogListResponse,
+    )
+    async def api_list_audit_logs(
+        bank_id: str,
+        action: str | None = Query(None, description="Filter by action type"),
+        transport: str | None = Query(None, description="Filter by transport (http, mcp, system)"),
+        start_date: str | None = Query(None, description="Filter from this ISO datetime (inclusive)"),
+        end_date: str | None = Query(None, description="Filter until this ISO datetime (exclusive)"),
+        limit: int = Query(50, ge=1, le=500, description="Max items to return"),
+        offset: int = Query(0, ge=0, description="Offset for pagination"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """List audit log entries for a bank."""
+        try:
+            from hindsight_api.engine.memory_engine import fq_table
+
+            pool = await app.state.memory._get_pool()
+
+            # Ensure bank exists
+            await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+
+            from hindsight_api.engine.db_utils import acquire_with_retry
+
+            async with acquire_with_retry(pool) as conn:
+                where_clauses = ["bank_id = $1"]
+                params: list[Any] = [bank_id]
+                idx = 2
+
+                if action:
+                    where_clauses.append(f"action = ${idx}")
+                    params.append(action)
+                    idx += 1
+
+                if transport:
+                    where_clauses.append(f"transport = ${idx}")
+                    params.append(transport)
+                    idx += 1
+
+                if start_date:
+                    parsed_start = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+                    where_clauses.append(f"started_at >= ${idx}")
+                    params.append(parsed_start)
+                    idx += 1
+
+                if end_date:
+                    parsed_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    where_clauses.append(f"started_at < ${idx}")
+                    params.append(parsed_end)
+                    idx += 1
+
+                where_sql = " AND ".join(where_clauses)
+                table = fq_table("audit_log")
+
+                # Get total count
+                count_row = await conn.fetchrow(
+                    f"SELECT COUNT(*) as total FROM {table} WHERE {where_sql}",
+                    *params,
+                )
+                total = count_row["total"] if count_row else 0
+
+                # Get paginated results
+                params.append(limit)
+                params.append(offset)
+                rows = await conn.fetch(
+                    f"""
+                    SELECT id, action, transport, bank_id, started_at, ended_at,
+                           request, response, metadata
+                    FROM {table}
+                    WHERE {where_sql}
+                    ORDER BY started_at DESC
+                    LIMIT ${idx} OFFSET ${idx + 1}
+                    """,
+                    *params,
+                )
+
+                items = []
+                for row in rows:
+                    duration_ms = None
+                    if row["started_at"] and row["ended_at"]:
+                        duration_ms = int((row["ended_at"] - row["started_at"]).total_seconds() * 1000)
+
+                    items.append(
+                        {
+                            "id": str(row["id"]),
+                            "action": row["action"],
+                            "transport": row["transport"],
+                            "bank_id": row["bank_id"],
+                            "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+                            "ended_at": row["ended_at"].isoformat() if row["ended_at"] else None,
+                            "duration_ms": duration_ms,
+                            "request": json.loads(row["request"]) if row["request"] else None,
+                            "response": json.loads(row["response"]) if row["response"] else None,
+                            "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                        }
+                    )
+
+                return {
+                    "bank_id": bank_id,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "items": items,
+                }
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            logger.error(f"Error listing audit logs: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/audit-logs/stats",
+        summary="Audit log statistics",
+        description="Get audit log counts grouped by time bucket for charting.",
+        operation_id="audit_log_stats",
+        tags=["Audit"],
+        response_model=AuditLogStatsResponse,
+    )
+    async def api_audit_log_stats(
+        bank_id: str,
+        action: str | None = Query(None, description="Filter by action type"),
+        period: str = Query("7d", description="Time period: 1d, 7d, or 30d"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Get audit log counts grouped by time bucket."""
+        try:
+            from hindsight_api.engine.db_utils import acquire_with_retry
+            from hindsight_api.engine.memory_engine import fq_table
+
+            pool = await app.state.memory._get_pool()
+            await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+
+            # Determine time range (always per-day buckets)
+            from datetime import timedelta as _td
+
+            now = datetime.now(timezone.utc)
+            trunc = "day"
+            if period == "1d":
+                start = now - _td(days=1)
+            elif period == "30d":
+                start = now - _td(days=30)
+            else:  # 7d default
+                start = now - _td(days=7)
+
+            table = fq_table("audit_log")
+
+            async with acquire_with_retry(pool) as conn:
+                where_clauses = ["bank_id = $1", "started_at >= $2"]
+                params: list[Any] = [bank_id, start]
+                idx = 3
+
+                if action:
+                    where_clauses.append(f"action = ${idx}")
+                    params.append(action)
+                    idx += 1
+
+                where_sql = " AND ".join(where_clauses)
+
+                rows = await conn.fetch(
+                    f"""
+                    SELECT date_trunc('{trunc}', started_at) AS bucket,
+                           action,
+                           COUNT(*) AS count
+                    FROM {table}
+                    WHERE {where_sql}
+                    GROUP BY bucket, action
+                    ORDER BY bucket ASC
+                    """,
+                    *params,
+                )
+
+                buckets: dict[str, dict[str, int]] = {}
+                for row in rows:
+                    bucket_key = row["bucket"].isoformat()
+                    if bucket_key not in buckets:
+                        buckets[bucket_key] = {}
+                    buckets[bucket_key][row["action"]] = row["count"]
+
+                return {
+                    "bank_id": bank_id,
+                    "period": period,
+                    "trunc": trunc,
+                    "start": start.isoformat(),
+                    "buckets": [{"time": k, "actions": v, "total": sum(v.values())} for k, v in buckets.items()],
+                }
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            logger.error(f"Error getting audit log stats: {traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(e))

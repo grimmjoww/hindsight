@@ -8,7 +8,7 @@ This module provides the core tool logic used by both:
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from fastmcp import FastMCP
@@ -18,10 +18,47 @@ from hindsight_api.config import (
     DEFAULT_MCP_RECALL_DESCRIPTION,
     DEFAULT_MCP_RETAIN_DESCRIPTION,
 )
+from hindsight_api.engine.audit import AuditEntry, AuditLogger
 from hindsight_api.engine.memory_engine import Budget
 from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES
 from hindsight_api.extensions import OperationValidationError
 from hindsight_api.models import RequestContext
+
+# All tools available in the system (explicit list — no wildcards).
+# Defined here (shared module) to avoid circular imports with api/mcp.py.
+_ALL_TOOLS: frozenset[str] = frozenset(
+    {
+        "retain",
+        "recall",
+        "reflect",
+        "list_banks",
+        "create_bank",
+        "list_mental_models",
+        "get_mental_model",
+        "create_mental_model",
+        "update_mental_model",
+        "delete_mental_model",
+        "refresh_mental_model",
+        "list_directives",
+        "create_directive",
+        "delete_directive",
+        "list_memories",
+        "get_memory",
+        "delete_memory",
+        "list_documents",
+        "get_document",
+        "delete_document",
+        "list_operations",
+        "get_operation",
+        "cancel_operation",
+        "list_tags",
+        "get_bank",
+        "get_bank_stats",
+        "update_bank",
+        "delete_bank",
+        "clear_memories",
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +326,7 @@ def register_mcp_tools(
         _register_clear_memories(mcp, memory, config)
 
     _apply_bank_tool_filtering(mcp, memory, config)
+    _apply_audit_logging(mcp, memory, config)
 
 
 def _apply_bank_tool_filtering(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
@@ -303,11 +341,29 @@ def _apply_bank_tool_filtering(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
         if not bank_id:
             return None
         request_context = _get_request_context(config)
+
+        # Layer 1: bank config filter (existing)
         bank_cfg = await memory._config_resolver.get_bank_config(bank_id, request_context)
-        enabled: list[str] | None = bank_cfg.get("mcp_enabled_tools")
-        if enabled is None:
-            return None
-        return set(enabled)
+        bank_tools: list[str] | None = bank_cfg.get("mcp_enabled_tools")
+        enabled: set[str] | None = set(bank_tools) if bank_tools is not None else None
+
+        # Layer 2: operation validator filter
+        validator = memory._operation_validator
+        if validator is not None:
+            candidate = frozenset(enabled) if enabled is not None else _ALL_TOOLS
+            try:
+                filtered = await validator.filter_mcp_tools(bank_id, request_context, candidate)
+            except Exception:
+                logger.warning("filter_mcp_tools raised, returning unfiltered tools", exc_info=True)
+                return enabled
+            if filtered != candidate:
+                # Validator can only narrow, never expand beyond the bank config ceiling.
+                if bank_tools is not None:
+                    enabled = set(filtered) & set(bank_tools)
+                else:
+                    enabled = set(filtered)
+
+        return enabled
 
     if hasattr(mcp, "list_tools"):
         # FastMCP 3.x: wrap list_tools() and get_tool() on the instance
@@ -359,6 +415,112 @@ def _apply_bank_tool_filtering(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
             logger.warning(f"Could not apply bank tool filtering (v2): {e}")
     else:
         logger.warning("Could not apply bank tool filtering: unknown FastMCP version")
+
+
+_AUDITABLE_MCP_TOOLS: frozenset[str] = frozenset(
+    {
+        "retain",
+        "recall",
+        "reflect",
+        "create_bank",
+        "update_bank",
+        "delete_bank",
+        "clear_memories",
+        "create_mental_model",
+        "update_mental_model",
+        "delete_mental_model",
+        "refresh_mental_model",
+        "create_directive",
+        "delete_directive",
+        "delete_memory",
+        "delete_document",
+        "cancel_operation",
+    }
+)
+
+
+def _apply_audit_logging(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
+    """Wrap auditable MCP tool run methods with audit logging."""
+    audit_logger: AuditLogger = memory.audit_logger
+
+    def _wrap_tool_run(tool_name: str, original_run):
+        """Create an audited wrapper for a tool's run method."""
+
+        async def _audited_run(arguments, _name=tool_name, _orig=original_run):
+            if not audit_logger.is_enabled(_name):
+                return await _orig(arguments)
+
+            bank_id = None
+            if isinstance(arguments, dict):
+                bank_id = arguments.get("bank_id") or (config.bank_id_resolver() if config.bank_id_resolver else None)
+            elif hasattr(arguments, "get"):
+                bank_id = arguments.get("bank_id")
+
+            entry = AuditEntry(
+                action=_name,
+                transport="mcp",
+                bank_id=bank_id,
+                started_at=datetime.now(timezone.utc),
+                request=dict(arguments) if isinstance(arguments, dict) else {"raw": str(arguments)},
+            )
+
+            try:
+                result = await _orig(arguments)
+                if isinstance(result, dict):
+                    entry.response = result
+                elif isinstance(result, list):
+                    entry.response = {"items": result}
+                elif isinstance(result, str):
+                    entry.response = {"text": result}
+                return result
+            finally:
+                entry.ended_at = datetime.now(timezone.utc)
+                audit_logger.log_fire_and_forget(entry)
+
+        return _audited_run
+
+    if hasattr(mcp, "_tool_manager"):
+        # FastMCP 2.x
+        try:
+            for name, tool in mcp._tool_manager._tools.items():  # type: ignore[unresolved-attribute]  # FastMCP 2.x internal; guarded by hasattr
+                if name in _AUDITABLE_MCP_TOOLS:
+                    object.__setattr__(tool, "run", _wrap_tool_run(name, tool.run))
+        except (AttributeError, KeyError) as e:
+            logger.warning(f"Could not apply MCP audit logging (v2): {e}")
+    elif hasattr(mcp, "get_tool"):
+        # FastMCP 3.x: wrap call_tool
+        original_call_tool = getattr(mcp, "call_tool", None)
+        if original_call_tool:
+
+            async def _audited_call_tool(name, arguments=None, **kwargs):
+                if name not in _AUDITABLE_MCP_TOOLS or not audit_logger.is_enabled(name):
+                    return await original_call_tool(name, arguments, **kwargs)
+
+                bank_id = None
+                if isinstance(arguments, dict):
+                    bank_id = arguments.get("bank_id") or (
+                        config.bank_id_resolver() if config.bank_id_resolver else None
+                    )
+
+                entry = AuditEntry(
+                    action=name,
+                    transport="mcp",
+                    bank_id=bank_id,
+                    started_at=datetime.now(timezone.utc),
+                    request=dict(arguments) if isinstance(arguments, dict) else {},
+                )
+
+                try:
+                    result = await original_call_tool(name, arguments, **kwargs)
+                    entry.response = {"result": str(result)[:4096]}
+                    return result
+                finally:
+                    entry.ended_at = datetime.now(timezone.utc)
+                    audit_logger.log_fire_and_forget(entry)
+
+            object.__setattr__(mcp, "call_tool", _audited_call_tool)
+    else:
+        logger.warning("Could not apply MCP audit logging: unknown FastMCP version")
 
 
 def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
@@ -840,6 +1002,7 @@ def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCP
         @mcp.tool()
         async def list_mental_models(
             tags: list[str] | None = None,
+            detail: str = "full",
             bank_id: str | None = None,
         ) -> str:
             """
@@ -851,6 +1014,7 @@ def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCP
 
             Args:
                 tags: Optional tags to filter by (returns models matching any tag)
+                detail: Detail level - 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response). Default: 'full'
                 bank_id: Optional bank to list from (defaults to session bank). Use for cross-bank operations.
             """
             try:
@@ -861,6 +1025,7 @@ def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCP
                 models = await memory.list_mental_models(
                     bank_id=target_bank,
                     tags=tags,
+                    detail=detail,
                     request_context=_get_request_context(config),
                 )
                 return json.dumps({"items": models}, indent=2, default=str)
@@ -876,6 +1041,7 @@ def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCP
         @mcp.tool()
         async def list_mental_models(
             tags: list[str] | None = None,
+            detail: str = "full",
         ) -> dict:
             """
             List mental models (pinned reflections) for this memory bank.
@@ -886,6 +1052,7 @@ def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCP
 
             Args:
                 tags: Optional tags to filter by (returns models matching any tag)
+                detail: Detail level - 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response). Default: 'full'
             """
             try:
                 target_bank = config.bank_id_resolver()
@@ -895,6 +1062,7 @@ def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCP
                 models = await memory.list_mental_models(
                     bank_id=target_bank,
                     tags=tags,
+                    detail=detail,
                     request_context=_get_request_context(config),
                 )
                 return {"items": models}
@@ -914,16 +1082,18 @@ def _register_get_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
         @mcp.tool()
         async def get_mental_model(
             mental_model_id: str,
+            detail: str = "full",
             bank_id: str | None = None,
         ) -> str:
             """
             Get a specific mental model by ID.
 
-            Returns the full mental model including its generated content, source query,
-            and metadata. Use list_mental_models first to discover available model IDs.
+            Returns the mental model with the requested detail level. Use list_mental_models
+            first to discover available model IDs.
 
             Args:
                 mental_model_id: The ID of the mental model to retrieve
+                detail: Detail level - 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response). Default: 'full'
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
             try:
@@ -934,6 +1104,7 @@ def _register_get_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 model = await memory.get_mental_model(
                     bank_id=target_bank,
                     mental_model_id=mental_model_id,
+                    detail=detail,
                     request_context=_get_request_context(config),
                 )
                 if model is None:
@@ -951,15 +1122,17 @@ def _register_get_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
         @mcp.tool()
         async def get_mental_model(
             mental_model_id: str,
+            detail: str = "full",
         ) -> dict:
             """
             Get a specific mental model by ID.
 
-            Returns the full mental model including its generated content, source query,
-            and metadata. Use list_mental_models first to discover available model IDs.
+            Returns the mental model with the requested detail level. Use list_mental_models
+            first to discover available model IDs.
 
             Args:
                 mental_model_id: The ID of the mental model to retrieve
+                detail: Detail level - 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response). Default: 'full'
             """
             try:
                 target_bank = config.bank_id_resolver()
@@ -969,6 +1142,7 @@ def _register_get_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 model = await memory.get_mental_model(
                     bank_id=target_bank,
                     mental_model_id=mental_model_id,
+                    detail=detail,
                     request_context=_get_request_context(config),
                 )
                 if model is None:
@@ -2711,6 +2885,7 @@ def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                 result = await memory.delete_bank(
                     target_bank,
                     fact_type=type,
+                    delete_bank_profile=False,
                     request_context=_get_request_context(config),
                 )
                 return json.dumps({"status": "cleared", "bank_id": target_bank, **result}, default=str)
@@ -2743,6 +2918,7 @@ def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                 result = await memory.delete_bank(
                     target_bank,
                     fact_type=type,
+                    delete_bank_profile=False,
                     request_context=_get_request_context(config),
                 )
                 return {"status": "cleared", "bank_id": target_bank, **result}

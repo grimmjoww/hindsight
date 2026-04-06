@@ -126,6 +126,32 @@ class CodexLLM(LLMInterface):
         }
         return mapping.get(effort.lower(), "auto")
 
+    def _normalize_tool_choice(self, tool_choice: str | dict[str, Any]) -> str | dict[str, Any]:
+        """Normalize forced function tool choice for the Codex Responses API.
+
+        Older agent paths may still pass OpenAI chat-completions style named
+        tool choice payloads such as:
+
+            {"type": "function", "function": {"name": "recall"}}
+
+        Codex Responses expects the named function at the top level instead:
+
+            {"type": "function", "name": "recall"}
+        """
+        if not isinstance(tool_choice, dict):
+            return tool_choice
+        if str(tool_choice.get("type") or "").strip() != "function":
+            return tool_choice
+        function_payload = tool_choice.get("function")
+        if isinstance(function_payload, dict):
+            function_name = str(function_payload.get("name") or "").strip()
+            if function_name:
+                return {"type": "function", "name": function_name}
+        function_name = str(tool_choice.get("name") or "").strip()
+        if function_name:
+            return {"type": "function", "name": function_name}
+        return tool_choice
+
     async def verify_connection(self) -> None:
         """Verify Codex connection by making a simple test call."""
         try:
@@ -140,6 +166,10 @@ class CodexLLM(LLMInterface):
             )
             logger.info(f"Codex LLM verified: {self.model}")
         except Exception as e:
+            # 429 means quota exhausted, not a configuration error — warn but allow startup
+            if "429" in str(e) or "usage_limit_reached" in str(e):
+                logger.warning(f"Codex LLM quota exhausted for {self.model}, continuing startup: {e}")
+                return
             raise RuntimeError(f"Codex LLM connection verification failed for {self.model}: {e}") from e
 
     async def call(
@@ -263,24 +293,27 @@ class CodexLLM(LLMInterface):
                 )
 
                 # Record trace span
-                from hindsight_api.tracing import get_span_recorder
+                try:
+                    from hindsight_api.tracing import get_span_recorder
 
-                # Estimate tokens for tracing
-                estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
-                estimated_output = len(content) // 4
-                span_recorder = get_span_recorder()
-                span_recorder.record_llm_call(
-                    provider=self.provider,
-                    model=self.model,
-                    scope=scope,
-                    messages=messages,
-                    response_content=result if isinstance(result, str) else json.dumps(result),
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
-                    duration=duration,
-                    finish_reason=None,
-                    error=None,
-                )
+                    # Estimate tokens for tracing
+                    estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
+                    estimated_output = len(content) // 4
+                    span_recorder = get_span_recorder()
+                    span_recorder.record_llm_call(
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        messages=messages,
+                        response_content=result if isinstance(result, str) else result.model_dump_json(),
+                        input_tokens=estimated_input,
+                        output_tokens=estimated_output,
+                        duration=duration,
+                        finish_reason=None,
+                        error=None,
+                    )
+                except Exception:
+                    pass  # logging failure must never affect the operation
 
                 if return_usage:
                     # Codex doesn't provide token counts, estimate based on content
@@ -422,7 +455,7 @@ class CodexLLM(LLMInterface):
             max_retries: Maximum retry attempts.
             initial_backoff: Initial backoff time in seconds.
             max_backoff: Maximum backoff time in seconds.
-            tool_choice: How to choose tools - "auto", "none", "required", or specific function.
+            tool_choice: How to choose tools - "auto", "none", "required", or a specific function.
 
         Returns:
             LLMToolCallResult with content and/or tool_calls.
@@ -479,7 +512,7 @@ class CodexLLM(LLMInterface):
             "instructions": system_instruction,
             "input": user_messages,
             "tools": codex_tools,
-            "tool_choice": tool_choice,
+            "tool_choice": self._normalize_tool_choice(tool_choice),
             "parallel_tool_calls": True,
             "reasoning": {"summary": reasoning_summary},
             "store": False,
@@ -526,26 +559,31 @@ class CodexLLM(LLMInterface):
             )
 
             # Record OpenTelemetry span
-            from hindsight_api.tracing import get_span_recorder
+            try:
+                from hindsight_api.tracing import get_span_recorder
 
-            span_recorder = get_span_recorder()
-            # Convert LLMToolCall objects to dicts for span recording
-            tool_calls_dict = (
-                [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls] if tool_calls else None
-            )
-            span_recorder.record_llm_call(
-                provider=self.provider,
-                model=self.model,
-                scope=scope,
-                messages=messages,
-                response_content=content,
-                input_tokens=0,  # Codex doesn't provide token counts
-                output_tokens=0,
-                duration=duration,
-                finish_reason="tool_calls" if tool_calls else "stop",
-                error=None,
-                tool_calls=tool_calls_dict,
-            )
+                span_recorder = get_span_recorder()
+                # Convert LLMToolCall objects to dicts for span recording
+                tool_calls_dict = (
+                    [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls]
+                    if tool_calls
+                    else None
+                )
+                span_recorder.record_llm_call(
+                    provider=self.provider,
+                    model=self.model,
+                    scope=scope,
+                    messages=messages,
+                    response_content=content,
+                    input_tokens=0,  # Codex doesn't provide token counts
+                    output_tokens=0,
+                    duration=duration,
+                    finish_reason="tool_calls" if tool_calls else "stop",
+                    error=None,
+                    tool_calls=tool_calls_dict,
+                )
+            except Exception:
+                pass  # logging failure must never affect the operation
 
             return LLMToolCallResult(
                 content=content,

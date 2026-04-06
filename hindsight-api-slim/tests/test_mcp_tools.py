@@ -1,5 +1,6 @@
 """Tests for the shared MCP tools module."""
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -75,25 +76,63 @@ class TestBuildContentDict:
 # =========================================================================
 
 
+_MENTAL_MODEL_METADATA_FIELDS = frozenset({"id", "bank_id", "name", "tags", "last_refreshed_at", "created_at"})
+
+_FULL_MENTAL_MODELS = [
+    {
+        "id": "mm-1",
+        "bank_id": "test-bank",
+        "name": "Coding Prefs",
+        "source_query": "coding preferences?",
+        "content": "Prefers Python",
+        "tags": ["coding"],
+        "max_tokens": 2048,
+        "trigger": {"interval": "daily"},
+        "last_refreshed_at": "2026-01-01T00:00:00",
+        "created_at": "2026-01-01T00:00:00",
+        "reflect_response": {"text": "Prefers Python", "based_on": {"world_facts": [{"id": "f1", "text": "Python is popular"}]}},
+    },
+    {
+        "id": "mm-2",
+        "bank_id": "test-bank",
+        "name": "Goals",
+        "source_query": "current goals?",
+        "content": "Ship v2",
+        "tags": [],
+        "max_tokens": 2048,
+        "trigger": None,
+        "last_refreshed_at": "2026-01-01T00:00:00",
+        "created_at": "2026-01-01T00:00:00",
+        "reflect_response": {"text": "Ship v2", "based_on": {}},
+    },
+]
+
+
+def _apply_detail(model: dict, detail: str) -> dict:
+    """Simulate engine detail filtering for mocks."""
+    if detail == "metadata":
+        return {k: v for k, v in model.items() if k in _MENTAL_MODEL_METADATA_FIELDS}
+    if detail == "content":
+        return {k: v for k, v in model.items() if k != "reflect_response"}
+    return model
+
+
 @pytest.fixture
 def mock_memory():
     """Create a mock MemoryEngine with all MCP tool methods."""
     memory = MagicMock()
-    # Mental model methods
-    memory.list_mental_models = AsyncMock(
-        return_value=[
-            {"id": "mm-1", "name": "Coding Prefs", "source_query": "coding preferences?", "content": "Prefers Python"},
-            {"id": "mm-2", "name": "Goals", "source_query": "current goals?", "content": "Ship v2"},
-        ]
-    )
-    memory.get_mental_model = AsyncMock(
-        return_value={
-            "id": "mm-1",
-            "name": "Coding Prefs",
-            "source_query": "coding preferences?",
-            "content": "Prefers Python",
-        }
-    )
+
+    # Mental model methods — simulate engine detail filtering
+    async def _list_mental_models(**kwargs):
+        detail = kwargs.get("detail", "full")
+        return [_apply_detail(m, detail) for m in _FULL_MENTAL_MODELS]
+
+    async def _get_mental_model(**kwargs):
+        detail = kwargs.get("detail", "full")
+        return _apply_detail(_FULL_MENTAL_MODELS[0], detail)
+
+    memory.list_mental_models = AsyncMock(side_effect=_list_mental_models)
+    memory.get_mental_model = AsyncMock(side_effect=_get_mental_model)
     memory.create_mental_model = AsyncMock(return_value={"id": "mm-new"})
     memory.submit_async_refresh_mental_model = AsyncMock(return_value={"operation_id": "op-123"})
     memory.update_mental_model = AsyncMock(
@@ -148,7 +187,7 @@ def mcp_server_with_mental_models(mock_memory):
     """Create a FastMCP server with mental model tools registered (multi-bank mode)."""
     from fastmcp import FastMCP
 
-    mcp = FastMCP("test", stateless_http=True)
+    mcp = FastMCP("test")
     config = MCPToolsConfig(
         bank_id_resolver=lambda: "test-bank",
         include_bank_id_param=True,
@@ -191,7 +230,7 @@ class TestMentalModelToolRegistration:
     """Test that mental model tools are registered correctly."""
 
     def test_tools_registered_multi_bank(self, mcp_server_with_mental_models):
-        tools = mcp_server_with_mental_models._tool_manager._tools
+        tools = _tools(mcp_server_with_mental_models)
         expected = {
             "list_mental_models",
             "get_mental_model",
@@ -203,7 +242,7 @@ class TestMentalModelToolRegistration:
         assert expected == set(tools.keys())
 
     def test_tools_registered_single_bank(self, mcp_server_single_bank):
-        tools = mcp_server_single_bank._tool_manager._tools
+        tools = _tools(mcp_server_single_bank)
         expected = {
             "list_mental_models",
             "get_mental_model",
@@ -218,7 +257,7 @@ class TestMentalModelToolRegistration:
     async def test_list_mental_models_propagates_request_context(self, mock_memory):
         from fastmcp import FastMCP
 
-        mcp = FastMCP("test", stateless_http=True)
+        mcp = FastMCP("test")
         config = MCPToolsConfig(
             bank_id_resolver=lambda: "test-bank",
             api_key_resolver=lambda: "test-api-key",
@@ -234,7 +273,7 @@ class TestMentalModelToolRegistration:
     async def test_create_mental_model_propagates_request_context(self, mock_memory):
         from fastmcp import FastMCP
 
-        mcp = FastMCP("test", stateless_http=True)
+        mcp = FastMCP("test")
         config = MCPToolsConfig(
             bank_id_resolver=lambda: "test-bank",
             api_key_resolver=lambda: "test-api-key",
@@ -281,14 +320,14 @@ class TestMentalModelToolRegistration:
         memory.get_bank_stats = AsyncMock(return_value={})
         memory.delete_bank = AsyncMock(return_value={})
 
-        mcp = FastMCP("test", stateless_http=True)
+        mcp = FastMCP("test")
         config = MCPToolsConfig(
             bank_id_resolver=lambda: "bank",
             include_bank_id_param=True,
             tools=None,  # Default - all tools
         )
         register_mcp_tools(mcp, memory, config)
-        tools = mcp._tool_manager._tools
+        tools = _tools(mcp)
         assert "list_mental_models" in tools
         assert "create_mental_model" in tools
         assert "refresh_mental_model" in tools
@@ -311,7 +350,7 @@ def no_bank_mcp_server(mock_memory):
     """Create a multi-bank MCP server where bank_id_resolver returns None."""
     from fastmcp import FastMCP
 
-    mcp = FastMCP("test", stateless_http=True)
+    mcp = FastMCP("test")
     config = MCPToolsConfig(
         bank_id_resolver=lambda: None,
         include_bank_id_param=True,
@@ -329,8 +368,12 @@ def no_bank_mcp_server(mock_memory):
 
 
 def _tools(mcp_server):
-    """Helper to get tools dict from MCP server."""
-    return mcp_server._tool_manager._tools
+    """Helper to get tools dict from MCP server (FastMCP 3.x compatible)."""
+    return {
+        k.split(":")[1].split("@")[0]: v
+        for k, v in mcp_server._local_provider._components.items()
+        if k.startswith("tool:")
+    }
 
 
 @pytest.mark.asyncio
@@ -386,12 +429,12 @@ class TestGetMentalModel:
         assert mock_memory.get_mental_model.call_args.kwargs["bank_id"] == "other-bank"
 
     async def test_get_not_found_multi_bank(self, mcp_server_with_mental_models, mock_memory):
-        mock_memory.get_mental_model.return_value = None
+        mock_memory.get_mental_model.side_effect = AsyncMock(return_value=None)
         result = await _tools(mcp_server_with_mental_models)["get_mental_model"].fn(mental_model_id="missing")
         assert "not found" in result
 
     async def test_get_not_found_single_bank(self, mcp_server_single_bank, mock_memory):
-        mock_memory.get_mental_model.return_value = None
+        mock_memory.get_mental_model.side_effect = AsyncMock(return_value=None)
         result = await _tools(mcp_server_single_bank)["get_mental_model"].fn(mental_model_id="missing")
         assert isinstance(result, dict)
         assert "not found" in result["error"]
@@ -409,6 +452,97 @@ class TestGetMentalModel:
         mock_memory.get_mental_model.side_effect = RuntimeError("DB error")
         result = await _tools(mcp_server_with_mental_models)["get_mental_model"].fn(mental_model_id="mm-1")
         assert "error" in result
+
+
+@pytest.mark.asyncio
+class TestListMentalModelsDetail:
+    """Test the detail parameter for list_mental_models."""
+
+    async def test_list_detail_full_includes_reflect_response(self, mcp_server_with_mental_models, mock_memory):
+        result = await _tools(mcp_server_with_mental_models)["list_mental_models"].fn(detail="full")
+        parsed = json.loads(result)
+        item = parsed["items"][0]
+        assert "reflect_response" in item
+        assert "content" in item
+        assert "source_query" in item
+
+    async def test_list_detail_content_excludes_reflect_response(self, mcp_server_with_mental_models, mock_memory):
+        result = await _tools(mcp_server_with_mental_models)["list_mental_models"].fn(detail="content")
+        parsed = json.loads(result)
+        item = parsed["items"][0]
+        assert "reflect_response" not in item
+        assert "content" in item
+        assert "source_query" in item
+        assert "trigger" in item
+
+    async def test_list_detail_metadata_only_has_core_fields(self, mcp_server_with_mental_models, mock_memory):
+        result = await _tools(mcp_server_with_mental_models)["list_mental_models"].fn(detail="metadata")
+        parsed = json.loads(result)
+        item = parsed["items"][0]
+        assert item["id"] == "mm-1"
+        assert item["name"] == "Coding Prefs"
+        assert "tags" in item
+        assert "content" not in item
+        assert "source_query" not in item
+        assert "reflect_response" not in item
+        assert "trigger" not in item
+
+    async def test_list_detail_default_is_full(self, mcp_server_with_mental_models, mock_memory):
+        result = await _tools(mcp_server_with_mental_models)["list_mental_models"].fn()
+        parsed = json.loads(result)
+        item = parsed["items"][0]
+        assert "reflect_response" in item
+
+    async def test_list_detail_single_bank_metadata(self, mcp_server_single_bank, mock_memory):
+        result = await _tools(mcp_server_single_bank)["list_mental_models"].fn(detail="metadata")
+        assert isinstance(result, dict)
+        item = result["items"][0]
+        assert "id" in item
+        assert "name" in item
+        assert "content" not in item
+        assert "reflect_response" not in item
+
+
+@pytest.mark.asyncio
+class TestGetMentalModelDetail:
+    """Test the detail parameter for get_mental_model."""
+
+    async def test_get_detail_full_includes_reflect_response(self, mcp_server_with_mental_models, mock_memory):
+        result = await _tools(mcp_server_with_mental_models)["get_mental_model"].fn(
+            mental_model_id="mm-1", detail="full"
+        )
+        parsed = json.loads(result)
+        assert "reflect_response" in parsed
+        assert "content" in parsed
+
+    async def test_get_detail_content_excludes_reflect_response(self, mcp_server_with_mental_models, mock_memory):
+        result = await _tools(mcp_server_with_mental_models)["get_mental_model"].fn(
+            mental_model_id="mm-1", detail="content"
+        )
+        parsed = json.loads(result)
+        assert "reflect_response" not in parsed
+        assert "content" in parsed
+        assert "source_query" in parsed
+
+    async def test_get_detail_metadata_only_has_core_fields(self, mcp_server_with_mental_models, mock_memory):
+        result = await _tools(mcp_server_with_mental_models)["get_mental_model"].fn(
+            mental_model_id="mm-1", detail="metadata"
+        )
+        parsed = json.loads(result)
+        assert parsed["id"] == "mm-1"
+        assert parsed["name"] == "Coding Prefs"
+        assert "tags" in parsed
+        assert "content" not in parsed
+        assert "reflect_response" not in parsed
+        assert "trigger" not in parsed
+
+    async def test_get_detail_single_bank_content(self, mcp_server_single_bank, mock_memory):
+        result = await _tools(mcp_server_single_bank)["get_mental_model"].fn(
+            mental_model_id="mm-1", detail="content"
+        )
+        assert isinstance(result, dict)
+        assert "content" in result
+        assert "reflect_response" not in result
 
 
 @pytest.mark.asyncio
@@ -698,12 +832,12 @@ class TestMentalModelInputValidation:
         mock_memory.update_mental_model.assert_not_called()
 
     async def test_not_found_error_includes_bank_id_multi_bank(self, mcp_server_with_mental_models, mock_memory):
-        mock_memory.get_mental_model.return_value = None
+        mock_memory.get_mental_model.side_effect = AsyncMock(return_value=None)
         result = await _tools(mcp_server_with_mental_models)["get_mental_model"].fn(mental_model_id="missing")
         assert "test-bank" in result
 
     async def test_not_found_error_includes_bank_id_single_bank(self, mcp_server_single_bank, mock_memory):
-        mock_memory.get_mental_model.return_value = None
+        mock_memory.get_mental_model.side_effect = AsyncMock(return_value=None)
         result = await _tools(mcp_server_single_bank)["get_mental_model"].fn(mental_model_id="missing")
         assert isinstance(result, dict)
         assert "fixed-bank" in result["error"]
@@ -718,7 +852,7 @@ def _make_mcp_server(mock_memory, tools, include_bank_id=True):
     """Helper to create an MCP server with specific tools."""
     from fastmcp import FastMCP
 
-    mcp = FastMCP("test", stateless_http=True)
+    mcp = FastMCP("test")
     config = MCPToolsConfig(
         bank_id_resolver=lambda: "test-bank",
         include_bank_id_param=include_bank_id,
@@ -1289,10 +1423,10 @@ class TestBankToolFiltering:
         register_mcp_tools(mcp, mock_memory_with_resolver, config)
 
         # Both tools are registered in the manager's internal dict
-        assert "recall" in mcp._tool_manager._tools
+        assert "recall" in _tools(mcp)
 
-        # But get_tools() (used by tools/list and tools/call) filters it out
-        visible = await mcp._tool_manager.get_tools()
+        # But list_tools() (used by tools/list and tools/call) filters it out
+        visible = {t.name for t in await mcp.list_tools()}
         assert "retain" in visible
         assert "recall" not in visible
 
@@ -1313,7 +1447,7 @@ class TestBankToolFiltering:
         )
         register_mcp_tools(mcp, mock_memory_with_resolver, config)
 
-        visible = await mcp._tool_manager.get_tools()
+        visible = {t.name for t in await mcp.list_tools()}
         assert "retain" in visible
         assert "recall" in visible
 
@@ -1332,7 +1466,7 @@ class TestBankToolFiltering:
         )
         register_mcp_tools(mcp, mock_memory_with_resolver, config)
 
-        visible = await mcp._tool_manager.get_tools()
+        visible = {t.name for t in await mcp.list_tools()}
         assert "retain" in visible
         assert "recall" in visible
 
@@ -1353,7 +1487,7 @@ class TestBankToolFiltering:
         )
         register_mcp_tools(mcp, mock_memory_with_resolver, config)
 
-        visible = await mcp._tool_manager.get_tools()
+        visible = {t.name for t in await mcp.list_tools()}
         # Filter bypassed — config resolver was never consulted, all tools visible
         assert "recall" in visible
         mock_memory_with_resolver._config_resolver.get_bank_config.assert_not_called()

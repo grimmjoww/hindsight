@@ -10,7 +10,7 @@ import uuid
 
 from ...config import get_config
 from ..memory_engine import fq_table
-from .bank_utils import DEFAULT_DISPOSITION, create_bank_hnsw_indexes
+from .bank_utils import DEFAULT_DISPOSITION, create_bank_vector_indexes
 from .fact_extraction import _sanitize_text
 from .types import ProcessedFact
 
@@ -44,7 +44,6 @@ async def insert_facts_batch(
     mentioned_ats = []
     contexts = []
     fact_types = []
-    confidence_scores = []
     metadata_jsons = []
     chunk_ids = []
     document_ids = []
@@ -64,8 +63,6 @@ async def insert_facts_batch(
         mentioned_ats.append(fact.mentioned_at)
         contexts.append(_sanitize_text(fact.context))
         fact_types.append(fact.fact_type)
-        # confidence_score is only for opinion facts
-        confidence_scores.append(1.0 if fact.fact_type == "opinion" else None)
         metadata_jsons.append(json.dumps(fact.metadata))
         chunk_ids.append(fact.chunk_id)
         # Use per-fact document_id if available, otherwise fallback to batch-level document_id
@@ -103,18 +100,18 @@ async def insert_facts_batch(
             WITH input_data AS (
                 SELECT * FROM unnest(
                     $2::text[], $3::vector[], $4::timestamptz[], $5::timestamptz[], $6::timestamptz[], $7::timestamptz[],
-                    $8::text[], $9::text[], $10::float[], $11::jsonb[], $12::text[], $13::text[], $14::jsonb[], $15::jsonb[], $16::text[]
+                    $8::text[], $9::text[], $10::jsonb[], $11::text[], $12::text[], $13::jsonb[], $14::jsonb[], $15::text[]
                 ) AS t(text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                       context, fact_type, confidence_score, metadata, chunk_id, document_id, tags_json,
+                       context, fact_type, metadata, chunk_id, document_id, tags_json,
                        observation_scopes_json, text_signals)
             )
             INSERT INTO {fq_table("memory_units")} (bank_id, text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                                     context, fact_type, confidence_score, metadata, chunk_id, document_id, tags,
+                                     context, fact_type, metadata, chunk_id, document_id, tags,
                                      observation_scopes, text_signals, search_vector)
             SELECT
                 $1,
                 text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                context, fact_type, confidence_score, metadata, chunk_id, document_id,
+                context, fact_type, metadata, chunk_id, document_id,
                 COALESCE(
                     (SELECT array_agg(elem) FROM jsonb_array_elements_text(tags_json) AS elem),
                     '{{}}'::varchar[]
@@ -135,18 +132,18 @@ async def insert_facts_batch(
             WITH input_data AS (
                 SELECT * FROM unnest(
                     $2::text[], $3::vector[], $4::timestamptz[], $5::timestamptz[], $6::timestamptz[], $7::timestamptz[],
-                    $8::text[], $9::text[], $10::float[], $11::jsonb[], $12::text[], $13::text[], $14::jsonb[], $15::jsonb[], $16::text[]
+                    $8::text[], $9::text[], $10::jsonb[], $11::text[], $12::text[], $13::jsonb[], $14::jsonb[], $15::text[]
                 ) AS t(text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                       context, fact_type, confidence_score, metadata, chunk_id, document_id, tags_json,
+                       context, fact_type, metadata, chunk_id, document_id, tags_json,
                        observation_scopes_json, text_signals)
             )
             INSERT INTO {fq_table("memory_units")} (bank_id, text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                                     context, fact_type, confidence_score, metadata, chunk_id, document_id, tags,
+                                     context, fact_type, metadata, chunk_id, document_id, tags,
                                      observation_scopes, text_signals)
             SELECT
                 $1,
                 text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                context, fact_type, confidence_score, metadata, chunk_id, document_id,
+                context, fact_type, metadata, chunk_id, document_id,
                 COALESCE(
                     (SELECT array_agg(elem) FROM jsonb_array_elements_text(tags_json) AS elem),
                     '{{}}'::varchar[]
@@ -168,7 +165,6 @@ async def insert_facts_batch(
         mentioned_ats,
         contexts,
         fact_types,
-        confidence_scores,
         metadata_jsons,
         chunk_ids,
         document_ids,
@@ -207,8 +203,8 @@ async def ensure_bank_exists(conn, bank_id: str) -> None:
         internal_id,
     )
     if inserted:
-        # Fresh insert — create per-bank HNSW indexes
-        await create_bank_hnsw_indexes(conn, bank_id, str(internal_id))
+        # Fresh insert — create per-bank vector indexes
+        await create_bank_vector_indexes(conn, bank_id, str(internal_id))
 
 
 async def handle_document_tracking(
@@ -221,7 +217,10 @@ async def handle_document_tracking(
     document_tags: list[str] | None = None,
 ) -> None:
     """
-    Handle document tracking in the database.
+    Handle document tracking in the database (full-replace mode).
+
+    Deletes the existing document (cascading to all units and links) on the
+    first batch, then inserts the new document record.
 
     Args:
         conn: Database connection
@@ -238,22 +237,58 @@ async def handle_document_tracking(
     combined_content = _sanitize_text(combined_content) or ""
     content_hash = hashlib.sha256(combined_content.encode()).hexdigest()
 
-    # Always delete old document first if it exists (cascades to units and links)
+    # Delete old document first (cascades to units and links)
     # Only delete on the first batch to avoid deleting data we just inserted
     if is_first_batch:
         await conn.fetchval(
-            f"DELETE FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 RETURNING id", document_id, bank_id
+            f"DELETE FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 RETURNING id",
+            document_id,
+            bank_id,
         )
 
     # Insert document (or update if exists from concurrent operations)
+    await _upsert_document_row(conn, bank_id, document_id, combined_content, content_hash, retain_params, document_tags)
+
+
+async def upsert_document_metadata(
+    conn,
+    bank_id: str,
+    document_id: str,
+    combined_content: str,
+    retain_params: dict | None = None,
+    document_tags: list[str] | None = None,
+) -> None:
+    """
+    Update document metadata without deleting existing facts/chunks.
+
+    Used by delta retain: the document row is upserted but chunks and
+    memory_units are managed separately at the chunk level.
+    """
+    import hashlib
+
+    combined_content = _sanitize_text(combined_content) or ""
+    content_hash = hashlib.sha256(combined_content.encode()).hexdigest()
+
+    await _upsert_document_row(conn, bank_id, document_id, combined_content, content_hash, retain_params, document_tags)
+
+
+async def _upsert_document_row(
+    conn,
+    bank_id: str,
+    document_id: str,
+    combined_content: str,
+    content_hash: str,
+    retain_params: dict | None = None,
+    document_tags: list[str] | None = None,
+) -> None:
+    """Insert or update a document row."""
     await conn.execute(
         f"""
-        INSERT INTO {fq_table("documents")} (id, bank_id, original_text, content_hash, metadata, retain_params, tags)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO {fq_table("documents")} (id, bank_id, original_text, content_hash, retain_params, tags)
+        VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT (id, bank_id) DO UPDATE
         SET original_text = EXCLUDED.original_text,
             content_hash = EXCLUDED.content_hash,
-            metadata = EXCLUDED.metadata,
             retain_params = EXCLUDED.retain_params,
             tags = EXCLUDED.tags,
             updated_at = NOW()
@@ -262,7 +297,37 @@ async def handle_document_tracking(
         bank_id,
         combined_content,
         content_hash,
-        json.dumps({}),  # Empty metadata dict
         json.dumps(retain_params) if retain_params else None,
         document_tags or [],
     )
+
+
+async def update_memory_units_tags(
+    conn,
+    bank_id: str,
+    document_id: str,
+    tags: list[str],
+) -> int:
+    """
+    Update tags on all memory_units belonging to a document.
+
+    Used during delta retain to propagate tag changes to unchanged facts.
+
+    Returns:
+        Number of memory units updated.
+    """
+    result = await conn.execute(
+        f"""
+        UPDATE {fq_table("memory_units")}
+        SET tags = $3, updated_at = NOW()
+        WHERE bank_id = $1 AND document_id = $2
+        """,
+        bank_id,
+        document_id,
+        tags or [],
+    )
+    # result is a status string like "UPDATE 5"
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError):
+        return 0

@@ -116,7 +116,7 @@ const config: Config = {
           showReadingTime: true,
           blogTitle: 'Hindsight Blog',
           blogDescription: 'Updates, insights, and deep dives into agent memory',
-          postsPerPage: 10,
+          postsPerPage: 'ALL',
           blogSidebarCount: 0,
         },
         theme: {
@@ -161,6 +161,18 @@ const config: Config = {
           expandSingleSchemaField: true,
           expandResponses: '200,201',
         },
+      },
+    ],
+  ],
+
+  plugins: [
+    [
+      '@docusaurus/plugin-content-docs',
+      {
+        id: 'integrations',
+        path: './docs-integrations',
+        routeBasePath: 'sdks/integrations',
+        sidebarPath: false,
       },
     ],
   ],
@@ -226,6 +238,11 @@ const config: Config = {
           position: 'left',
           className: 'navbar-item-resources',
           items: [
+            {
+              to: '/templates',
+              label: 'Bank Templates Hub',
+              customProps: { icon: 'lu-layout-template' },
+            },
             {
               to: '/best-practices',
               label: 'Best Practices',

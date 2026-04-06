@@ -32,12 +32,18 @@ VALID_INTEGRATIONS = [
     "litellm",
     "pydantic-ai",
     "crewai",
+    "ag2",
     "ai-sdk",
     "chat",
     "openclaw",
     "langgraph",
     "nemoclaw",
     "strands",
+    "claude-code",
+    "llamaindex",
+    "codex",
+    "hermes",
+    "autogen",
 ]
 
 
@@ -511,17 +517,25 @@ def _get_package_name(integration: str) -> str:
         "litellm": "hindsight-litellm",
         "pydantic-ai": "hindsight-pydantic-ai",
         "crewai": "hindsight-crewai",
+        "ag2": "hindsight-ag2",
         "ai-sdk": "@vectorize-io/hindsight-ai-sdk",
         "chat": "@vectorize-io/hindsight-chat",
         "openclaw": "@vectorize-io/hindsight-openclaw",
         "langgraph": "hindsight-langgraph",
         "nemoclaw": "@vectorize-io/hindsight-nemoclaw",
         "strands": "hindsight-strands",
+        "claude-code": "hindsight-memory",
+        "llamaindex": "hindsight-llamaindex",
+        "codex": "hindsight-codex",
+        "hermes": "hindsight-hermes",
+        "autogen": "hindsight-autogen",
     }
     return packages[integration]
 
 
 def _package_url(integration: str, package_name: str) -> str:
+    if integration == "claude-code":
+        return "https://github.com/vectorize-io/hindsight/tree/main/hindsight-integrations/claude-code"
     if package_name.startswith("@"):
         return f"https://www.npmjs.com/package/{package_name}"
     return f"https://pypi.org/project/{package_name}/"
@@ -538,6 +552,11 @@ def _integration_display_name(integration: str) -> str:
         "langgraph": "LangGraph",
         "nemoclaw": "NemoClaw",
         "strands": "Strands",
+        "claude-code": "Claude Code",
+        "llamaindex": "LlamaIndex",
+        "codex": "Codex",
+        "hermes": "Hermes",
+        "autogen": "AutoGen",
     }
     return names.get(integration, integration)
 

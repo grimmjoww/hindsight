@@ -16,6 +16,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +29,7 @@ from ..metrics import get_metrics_collector
 from ..tracing import create_operation_span
 from ..utils import mask_network_location
 from ..worker.exceptions import RetryTaskAt
+from .audit import AuditLogger, audit_context
 from .db_budget import budgeted_operation
 from .operation_metadata import (
     BatchRetainChildMetadata,
@@ -225,6 +227,42 @@ def _get_tiktoken_encoding():
     return _TIKTOKEN_ENCODING
 
 
+@dataclass(frozen=True)
+class RefreshTagFiltering:
+    """Resolved tag filtering parameters for mental model refresh."""
+
+    tags: list[str] | None
+    tags_match: TagsMatch
+    tag_groups: list[TagGroup] | None
+
+
+def _resolve_refresh_tag_filtering(
+    model_tags: list[str] | None,
+    trigger_data: dict[str, Any],
+) -> RefreshTagFiltering:
+    """Resolve tag filtering parameters for mental model refresh.
+
+    Takes raw trigger dict from DB (JSONB with no fixed schema guarantee)
+    and resolves the tag filtering to use during reflect.
+
+    Priority:
+    - If trigger has tag_groups, use those (overrides flat tags entirely)
+    - If trigger has tags_match, use model's tags with that match mode
+    - Otherwise default to all_strict when tags present (security isolation)
+    """
+    trigger_tag_groups = trigger_data.get("tag_groups")
+    if trigger_tag_groups is not None:
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(TagGroup)
+        parsed = [adapter.validate_python(tg) for tg in trigger_tag_groups]
+        return RefreshTagFiltering(tags=None, tags_match="any", tag_groups=parsed)
+
+    trigger_tags_match = trigger_data.get("tags_match")
+    tags_match: TagsMatch = trigger_tags_match if trigger_tags_match else ("all_strict" if model_tags else "any")
+    return RefreshTagFiltering(tags=model_tags, tags_match=tags_match, tag_groups=None)
+
+
 class MemoryEngine(MemoryEngineInterface):
     """
     Advanced memory system using temporal and semantic linking with PostgreSQL.
@@ -232,7 +270,7 @@ class MemoryEngine(MemoryEngineInterface):
     This class provides:
     - Embedding generation for semantic search
     - Entity, temporal, and semantic link creation
-    - Think operations for formulating answers with opinions
+    - Think operations for formulating answers with observations
     - bank profile and disposition management
     """
 
@@ -395,6 +433,7 @@ class MemoryEngine(MemoryEngineInterface):
             api_key=memory_llm_api_key,
             base_url=memory_llm_base_url,
             model=memory_llm_model,
+            extra_body=config.llm_extra_body,
         )
 
         # Store client and model for convenience (deprecated: use _llm_config.call() instead)
@@ -421,6 +460,7 @@ class MemoryEngine(MemoryEngineInterface):
             api_key=retain_api_key,
             base_url=retain_base_url,
             model=retain_model,
+            extra_body=config.llm_extra_body,
         )
 
         # Reflect LLM config - for think/observe operations (can use lighter models)
@@ -442,6 +482,7 @@ class MemoryEngine(MemoryEngineInterface):
             api_key=reflect_api_key,
             base_url=reflect_base_url,
             model=reflect_model,
+            extra_body=config.llm_extra_body,
         )
 
         # Consolidation LLM config - for mental model consolidation (can use efficient models)
@@ -463,6 +504,7 @@ class MemoryEngine(MemoryEngineInterface):
             api_key=consolidation_api_key,
             base_url=consolidation_base_url,
             model=consolidation_model,
+            extra_body=config.llm_extra_body,
         )
 
         # Initialize cross-encoder reranker (cached for performance)
@@ -476,14 +518,25 @@ class MemoryEngine(MemoryEngineInterface):
             schema_getter=get_current_schema,
         )
 
+        # Audit logger for feature usage tracking
+        config = get_config()
+        self._audit_logger = AuditLogger(
+            pool_getter=lambda: self._pool,
+            schema_getter=get_current_schema,
+            enabled=config.audit_log_enabled,
+            allowed_actions=config.audit_log_actions,
+            retention_days=config.audit_log_retention_days,
+        )
+
         # Backpressure mechanism: limit concurrent searches to prevent overwhelming the database
         # Configurable via HINDSIGHT_API_RECALL_MAX_CONCURRENT (default: 50)
         self._search_semaphore = asyncio.Semaphore(get_config().recall_max_concurrent)
 
-        # Backpressure for put operations: limit concurrent puts to prevent database contention
-        # Each put_batch holds a connection for the entire transaction, so we limit to 5
-        # concurrent puts to avoid connection pool exhaustion and reduce write contention
-        self._put_semaphore = asyncio.Semaphore(5)
+        # Backpressure for retain DB writes: limit concurrent transactions to prevent contention
+        # on entity/link tables. Acquired in the orchestrator *after* LLM extraction completes,
+        # so LLM calls run in full parallelism while only the DB-heavy phase is throttled.
+        # Configurable via HINDSIGHT_API_RETAIN_MAX_CONCURRENT (default: 4).
+        self._put_semaphore = asyncio.Semaphore(get_config().retain_max_concurrent)
 
         # initialize encoding eagerly to avoid delaying the first time
         _get_tiktoken_encoding()
@@ -497,6 +550,11 @@ class MemoryEngine(MemoryEngineInterface):
 
             tenant_extension = DefaultTenantExtension(config={})
         self._tenant_extension = tenant_extension
+
+    @property
+    def audit_logger(self) -> AuditLogger:
+        """The audit logger for feature usage tracking."""
+        return self._audit_logger
 
     @property
     def tenant_extension(self) -> "TenantExtension | None":
@@ -888,17 +946,13 @@ class MemoryEngine(MemoryEngineInterface):
 
         source_query = mental_model["source_query"]
 
-        # SECURITY: If the mental model has tags, pass them to reflect with "all_strict" matching
-        # to ensure it can only access other mental models/memories with the SAME tags.
-        # This prevents cross-tenant/cross-user information leakage by excluding untagged content.
-        tags = mental_model.get("tags")
-        tags_match = "all_strict" if tags else "any"
-
         # Read reflect options from trigger (if stored)
         trigger_data = mental_model.get("trigger") or {}
         fact_types = trigger_data.get("fact_types")
         exclude_mental_models = trigger_data.get("exclude_mental_models", False)
         stored_exclude_ids: list[str] = trigger_data.get("exclude_mental_model_ids") or []
+
+        tag_filtering = _resolve_refresh_tag_filtering(mental_model.get("tags"), trigger_data)
 
         # Run reflect to generate new content, excluding the mental model being refreshed
         # Always add self to excluded IDs to prevent circular reference
@@ -906,8 +960,9 @@ class MemoryEngine(MemoryEngineInterface):
             bank_id=bank_id,
             query=source_query,
             request_context=internal_context,
-            tags=tags,
-            tags_match=tags_match,
+            tags=tag_filtering.tags,
+            tags_match=tag_filtering.tags_match,
+            tag_groups=tag_filtering.tag_groups,
             fact_types=fact_types,
             exclude_mental_models=exclude_mental_models,
             exclude_mental_model_ids=list({*stored_exclude_ids, mental_model_id}),
@@ -1030,72 +1085,78 @@ class MemoryEngine(MemoryEngineInterface):
                 # Continue with processing if we can't check status
 
         consolidation_result: dict | None = None
-        try:
-            if task_type == "batch_retain":
-                await self._handle_batch_retain(task_dict)
-            elif task_type == "file_convert_retain":
-                await self._handle_file_convert_retain(task_dict)
-            elif task_type == "consolidation":
-                consolidation_result = await self._handle_consolidation(task_dict)
-            elif task_type == "refresh_mental_model":
-                await self._handle_refresh_mental_model(task_dict)
-            elif task_type == "webhook_delivery":
-                await self._handle_webhook_delivery(task_dict)
-            else:
-                logger.error(f"Unknown task type: {task_type}")
-                # Don't retry unknown task types
-                if operation_id:
-                    await self._delete_operation_record(operation_id)
-                return
-
-            # Task succeeded - mark operation as completed
-            # file_convert_retain marks itself as completed in a transaction, skip double-marking
-            if operation_id and task_type not in ("file_convert_retain",):
-                if task_type == "consolidation":
-                    # Atomically mark completed AND queue webhook delivery in one transaction
-                    await self._mark_operation_completed_and_fire_webhook(
-                        operation_id=operation_id,
-                        bank_id=task_dict.get("bank_id", ""),
-                        status="completed",
-                        result=consolidation_result,
-                        schema=schema,
-                    )
+        bank_id = task_dict.get("bank_id")
+        async with audit_context(
+            self._audit_logger, task_type or "unknown", "system", bank_id, request=task_dict
+        ) as audit_entry:
+            try:
+                if task_type == "batch_retain":
+                    await self._handle_batch_retain(task_dict)
+                elif task_type == "file_convert_retain":
+                    await self._handle_file_convert_retain(task_dict)
+                elif task_type == "consolidation":
+                    consolidation_result = await self._handle_consolidation(task_dict)
+                elif task_type == "refresh_mental_model":
+                    await self._handle_refresh_mental_model(task_dict)
+                elif task_type == "webhook_delivery":
+                    await self._handle_webhook_delivery(task_dict)
                 else:
-                    await self._mark_operation_completed(operation_id)
+                    logger.error(f"Unknown task type: {task_type}")
+                    # Don't retry unknown task types
+                    if operation_id:
+                        await self._delete_operation_record(operation_id)
+                    return
 
-        except RetryTaskAt:
-            # Task-owned retry: let the poller handle scheduling
-            raise
-        except Exception as e:
-            logger.error(f"Task execution failed: {task_type}, error: {e}")
-            import traceback
+                # Task succeeded - mark operation as completed
+                # file_convert_retain marks itself as completed in a transaction, skip double-marking
+                if operation_id and task_type not in ("file_convert_retain",):
+                    if task_type == "consolidation":
+                        # Atomically mark completed AND queue webhook delivery in one transaction
+                        await self._mark_operation_completed_and_fire_webhook(
+                            operation_id=operation_id,
+                            bank_id=task_dict.get("bank_id", ""),
+                            status="completed",
+                            result=consolidation_result,
+                            schema=schema,
+                        )
+                    else:
+                        await self._mark_operation_completed(operation_id)
 
-            error_traceback = traceback.format_exc()
-            traceback.print_exc()
+                audit_entry.response = {"status": "completed", "operation_id": operation_id}
 
-            if task_type == "file_convert_retain":
-                # Non-retryable: mark as failed immediately.
-                # Conversion failures won't improve on retry (missing OCR, corrupted file, etc.)
-                logger.error(f"Not retrying task {task_type} (non-retryable), marking as failed")
-                if operation_id:
-                    await self._mark_operation_failed(operation_id, str(e), error_traceback)
-            else:
-                if task_type == "consolidation" and operation_id:
-                    # Fire failure webhook (non-transactional — operation not yet marked failed;
-                    # poller will mark it failed after this raise)
-                    await self._fire_consolidation_webhook(
-                        bank_id=task_dict.get("bank_id", ""),
-                        operation_id=operation_id,
-                        status="failed",
-                        result=None,
-                        error_message=str(e),
-                        schema=schema,
-                    )
-                # Retryable: use RetryTaskAt if under the retry limit, else re-raise (poller marks failed)
-                retry_count = task_dict.get("_retry_count", 0)
-                if retry_count < 3:
-                    raise RetryTaskAt(retry_at=datetime.now(UTC) + timedelta(seconds=60), message=str(e))
+            except RetryTaskAt:
+                # Task-owned retry: let the poller handle scheduling
                 raise
+            except Exception as e:
+                logger.error(f"Task execution failed: {task_type}, error: {e}")
+                import traceback
+
+                error_traceback = traceback.format_exc()
+                traceback.print_exc()
+
+                if task_type == "file_convert_retain":
+                    # Non-retryable: mark as failed immediately.
+                    # Conversion failures won't improve on retry (missing OCR, corrupted file, etc.)
+                    logger.error(f"Not retrying task {task_type} (non-retryable), marking as failed")
+                    if operation_id:
+                        await self._mark_operation_failed(operation_id, str(e), error_traceback)
+                else:
+                    if task_type == "consolidation" and operation_id:
+                        # Fire failure webhook (non-transactional — operation not yet marked failed;
+                        # poller will mark it failed after this raise)
+                        await self._fire_consolidation_webhook(
+                            bank_id=task_dict.get("bank_id", ""),
+                            operation_id=operation_id,
+                            status="failed",
+                            result=None,
+                            error_message=str(e),
+                            schema=schema,
+                        )
+                    # Retryable: use RetryTaskAt if under the retry limit, else re-raise (poller marks failed)
+                    retry_count = task_dict.get("_retry_count", 0)
+                    if retry_count < 3:
+                        raise RetryTaskAt(retry_at=datetime.now(UTC) + timedelta(seconds=60), message=str(e))
+                    raise
 
     async def _fire_consolidation_webhook(
         self,
@@ -1659,17 +1720,15 @@ class MemoryEngine(MemoryEngineInterface):
             # Migrate all schemas from the tenant extension
             # The tenant extension is the single source of truth for which schemas exist
             logger.info("Running database migrations...")
+            config = get_config()
             tenants = await self._tenant_extension.list_tenants()
             if tenants:
                 logger.info(f"Running migrations on {len(tenants)} schema(s)...")
                 for tenant in tenants:
                     schema = tenant.schema
                     if schema:
-                        run_migrations(self.db_url, schema=schema)
+                        run_migrations(self.db_url, schema=schema, migration_database_url=config.migration_database_url)
                 logger.info("Schema migrations completed")
-
-                # Get config for vector extension setting
-                config = get_config()
 
                 # Ensure embedding column dimension matches the model's dimension
                 # This is done after migrations and after embeddings.initialize()
@@ -1791,6 +1850,9 @@ class MemoryEngine(MemoryEngineInterface):
         self._task_backend.set_executor(self.execute_task)
         await self._task_backend.initialize()
 
+        # Start audit log retention sweep (if configured)
+        self._audit_logger.start_retention_sweep()
+
         self._initialized = True
         logger.info("Memory system initialized (pool and task backend started)")
 
@@ -1842,6 +1904,9 @@ class MemoryEngine(MemoryEngineInterface):
     async def close(self):
         """Close the connection pool and shutdown background workers."""
         logger.info("close() started")
+
+        # Stop audit log retention sweep
+        await self._audit_logger.stop_retention_sweep()
 
         # Shutdown task backend
         await self._task_backend.shutdown()
@@ -1938,7 +2003,6 @@ class MemoryEngine(MemoryEngineInterface):
         event_date: datetime | None = None,
         document_id: str | None = None,
         fact_type_override: str | None = None,
-        confidence_score: float | None = None,
         *,
         request_context: "RequestContext",
     ) -> list[str]:
@@ -1954,7 +2018,6 @@ class MemoryEngine(MemoryEngineInterface):
             event_date: When the event occurred (defaults to now)
             document_id: Optional document ID for tracking (always upserts if document already exists)
             fact_type_override: Override fact type ('world', 'experience')
-            confidence_score: Confidence score (0.0 to 1.0)
             request_context: Request context for authentication.
 
         Returns:
@@ -1973,7 +2036,6 @@ class MemoryEngine(MemoryEngineInterface):
             contents=[content_dict],
             request_context=request_context,
             fact_type_override=fact_type_override,
-            confidence_score=confidence_score,
         )
 
         # Return the first (and only) list of unit IDs
@@ -1987,7 +2049,6 @@ class MemoryEngine(MemoryEngineInterface):
         request_context: "RequestContext",
         document_id: str | None = None,
         fact_type_override: str | None = None,
-        confidence_score: float | None = None,
         document_tags: list[str] | None = None,
         return_usage: bool = False,
         operation_id: str | None = None,
@@ -2013,7 +2074,6 @@ class MemoryEngine(MemoryEngineInterface):
             document_id: **DEPRECATED** - Use "document_id" key in each content dict instead.
                         Applies the same document_id to ALL content items that don't specify their own.
             fact_type_override: Override fact type for all facts ('world', 'experience')
-            confidence_score: Confidence score (0.0 to 1.0)
             return_usage: If True, returns tuple of (unit_ids, TokenUsage). Default False for backward compatibility.
 
         Returns:
@@ -2063,7 +2123,6 @@ class MemoryEngine(MemoryEngineInterface):
                 request_context=request_context,
                 document_id=document_id,
                 fact_type_override=fact_type_override,
-                confidence_score=confidence_score,
             )
             result = await self._validate_operation(self._operation_validator.validate_retain(ctx))
             if result and result.contents is not None:
@@ -2149,7 +2208,6 @@ class MemoryEngine(MemoryEngineInterface):
                     document_id=document_id,
                     is_first_batch=i == 1,  # Only upsert on first batch
                     fact_type_override=fact_type_override,
-                    confidence_score=confidence_score,
                     document_tags=document_tags,
                     operation_id=operation_id,
                     strategy=strategy,
@@ -2174,7 +2232,6 @@ class MemoryEngine(MemoryEngineInterface):
                 document_id=document_id,
                 is_first_batch=True,
                 fact_type_override=fact_type_override,
-                confidence_score=confidence_score,
                 document_tags=document_tags,
                 operation_id=operation_id,
                 strategy=strategy,
@@ -2191,7 +2248,6 @@ class MemoryEngine(MemoryEngineInterface):
                 request_context=request_context,
                 document_id=document_id,
                 fact_type_override=fact_type_override,
-                confidence_score=confidence_score,
                 unit_ids=result,
                 success=True,
                 error=None,
@@ -2226,7 +2282,6 @@ class MemoryEngine(MemoryEngineInterface):
         document_id: str | None = None,
         is_first_batch: bool = True,
         fact_type_override: str | None = None,
-        confidence_score: float | None = None,
         document_tags: list[str] | None = None,
         operation_id: str | None = None,
         outbox_callback: "Callable[[asyncpg.Connection], Awaitable[None]] | None" = None,
@@ -2247,54 +2302,51 @@ class MemoryEngine(MemoryEngineInterface):
             document_id: Optional document ID (always upserts if exists)
             is_first_batch: Whether this is the first batch (for chunked operations, only delete on first batch)
             fact_type_override: Override fact type for all facts
-            confidence_score: Confidence score for opinions
             document_tags: Tags applied to all items in this batch
 
         Returns:
             Tuple of (unit ID lists, token usage for fact extraction)
         """
-        # Backpressure: limit concurrent retains to prevent database contention
-        async with self._put_semaphore:
-            # Use the new modular orchestrator
-            from .retain import orchestrator
+        # Use the new modular orchestrator
+        from .retain import orchestrator
 
-            pool = await self._get_pool()
+        pool = await self._get_pool()
 
-            # Resolve bank-specific config for this operation
-            resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+        # Resolve bank-specific config for this operation
+        resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
 
-            # Force chunks mode when LLM provider is "none" (no LLM available for fact extraction)
-            if self._llm_config.provider == "none":
-                resolved_config.retain_extraction_mode = "chunks"
-                resolved_config.enable_observations = False
+        # Force chunks mode when LLM provider is "none" (no LLM available for fact extraction)
+        if self._llm_config.provider == "none":
+            resolved_config.retain_extraction_mode = "chunks"
+            resolved_config.enable_observations = False
 
-            # Apply strategy overrides: explicit strategy > bank default strategy
-            from hindsight_api.config_resolver import apply_strategy
+        # Apply strategy overrides: explicit strategy > bank default strategy
+        from hindsight_api.config_resolver import apply_strategy
 
-            effective_strategy = strategy or resolved_config.retain_default_strategy
-            if effective_strategy:
-                resolved_config = apply_strategy(resolved_config, effective_strategy)
+        effective_strategy = strategy or resolved_config.retain_default_strategy
+        if effective_strategy:
+            resolved_config = apply_strategy(resolved_config, effective_strategy)
 
-            # Create parent span for retain operation
-            with create_operation_span("retain", bank_id):
-                return await orchestrator.retain_batch(
-                    pool=pool,
-                    embeddings_model=self.embeddings,
-                    llm_config=self._retain_llm_config.with_config(resolved_config),
-                    entity_resolver=self.entity_resolver,
-                    format_date_fn=self._format_readable_date,
-                    bank_id=bank_id,
-                    contents_dicts=contents,
-                    document_id=document_id,
-                    is_first_batch=is_first_batch,
-                    fact_type_override=fact_type_override,
-                    confidence_score=confidence_score,
-                    document_tags=document_tags,
-                    config=resolved_config,
-                    operation_id=operation_id,
-                    schema=_current_schema.get(),
-                    outbox_callback=outbox_callback,
-                )
+        # Create parent span for retain operation
+        with create_operation_span("retain", bank_id):
+            return await orchestrator.retain_batch(
+                pool=pool,
+                embeddings_model=self.embeddings,
+                llm_config=self._retain_llm_config.with_config(resolved_config),
+                entity_resolver=self.entity_resolver,
+                format_date_fn=self._format_readable_date,
+                bank_id=bank_id,
+                contents_dicts=contents,
+                document_id=document_id,
+                is_first_batch=is_first_batch,
+                fact_type_override=fact_type_override,
+                document_tags=document_tags,
+                config=resolved_config,
+                operation_id=operation_id,
+                schema=_current_schema.get(),
+                outbox_callback=outbox_callback,
+                db_semaphore=self._put_semaphore,
+            )
 
     def recall(
         self,
@@ -2314,7 +2366,7 @@ class MemoryEngine(MemoryEngineInterface):
         Args:
             bank_id: bank ID to recall for
             query: Recall query
-            fact_type: Required filter for fact type ('world', 'experience', or 'opinion')
+            fact_type: Required filter for fact type ('world' or 'experience')
             budget: Budget level for graph traversal (low=100, mid=300, high=600 units)
             max_tokens: Maximum tokens to return (counts only 'text' field, default 4096)
             enable_trace: If True, returns detailed trace object
@@ -2408,8 +2460,10 @@ class MemoryEngine(MemoryEngineInterface):
         if fact_type is None:
             fact_type = list(VALID_RECALL_FACT_TYPES)
 
-        # Filter out 'opinion' early (deprecated, silently ignore)
+        # Filter out 'opinion' (removed fact type, silently ignore for backwards compat)
         fact_type = [ft for ft in fact_type if ft != "opinion"]
+        if not fact_type:
+            return RecallResultModel(results=[], entities={}, chunks={})
 
         # Validate fact types
         invalid_types = set(fact_type) - VALID_RECALL_FACT_TYPES
@@ -2418,9 +2472,6 @@ class MemoryEngine(MemoryEngineInterface):
                 f"Invalid fact type(s): {', '.join(sorted(invalid_types))}. "
                 f"Must be one of: {', '.join(sorted(VALID_RECALL_FACT_TYPES))}"
             )
-        if not fact_type:
-            # All requested types were opinions - return empty result
-            return RecallResultModel(results=[], entities={}, chunks={})
 
         # Validate operation if validator is configured
         if self._operation_validator:
@@ -2768,7 +2819,7 @@ class MemoryEngine(MemoryEngineInterface):
                 "temporal": 0.0,
                 "temporal_extraction": 0.0,
             }
-            all_mpfp_timings = []
+            all_graph_timings = []
 
             detected_temporal_constraint = None
             max_conn_wait = multi_result.max_conn_wait
@@ -2830,25 +2881,25 @@ class MemoryEngine(MemoryEngineInterface):
             )
 
             # Log graph retriever timing breakdown if available
-            if all_mpfp_timings:
+            if all_graph_timings:
                 retriever_name = get_default_graph_retriever().name.upper()
-                mpfp_total = all_mpfp_timings[0]  # Take first fact type's timing as representative
-                mpfp_parts = [
-                    f"db_queries={mpfp_total.db_queries}",
-                    f"edge_load={mpfp_total.edge_load_time:.3f}s",
-                    f"edges={mpfp_total.edge_count}",
-                    f"patterns={mpfp_total.pattern_count}",
+                graph_total = all_graph_timings[0]  # Take first fact type's timing as representative
+                graph_parts = [
+                    f"db_queries={graph_total.db_queries}",
+                    f"edge_load={graph_total.edge_load_time:.3f}s",
+                    f"edges={graph_total.edge_count}",
+                    f"patterns={graph_total.pattern_count}",
                 ]
-                if mpfp_total.seeds_time > 0.01:
-                    mpfp_parts.append(f"seeds={mpfp_total.seeds_time:.3f}s")
-                if mpfp_total.fusion > 0.001:
-                    mpfp_parts.append(f"fusion={mpfp_total.fusion:.3f}s")
-                if mpfp_total.fetch > 0.001:
-                    mpfp_parts.append(f"fetch={mpfp_total.fetch:.3f}s")
-                log_buffer.append(f"      [{retriever_name}] {', '.join(mpfp_parts)}")
+                if graph_total.seeds_time > 0.01:
+                    graph_parts.append(f"seeds={graph_total.seeds_time:.3f}s")
+                if graph_total.fusion > 0.001:
+                    graph_parts.append(f"fusion={graph_total.fusion:.3f}s")
+                if graph_total.fetch > 0.001:
+                    graph_parts.append(f"fetch={graph_total.fetch:.3f}s")
+                log_buffer.append(f"      [{retriever_name}] {', '.join(graph_parts)}")
                 # Log detailed hop timing for debugging slow queries
-                if mpfp_total.hop_details:
-                    for hd in mpfp_total.hop_details:
+                if graph_total.hop_details:
+                    for hd in graph_total.hop_details:
                         log_buffer.append(
                             f"        hop{hd['hop']}: exec={hd.get('exec_time', 0) * 1000:.0f}ms, "
                             f"uncached={hd.get('uncached_after_filter', 0)}, "
@@ -3483,11 +3534,13 @@ class MemoryEngine(MemoryEngineInterface):
             doc = await conn.fetchrow(
                 f"""
                 SELECT d.id, d.bank_id, d.original_text, d.content_hash,
-                       d.created_at, d.updated_at, d.tags, COUNT(mu.id) as unit_count
+                       d.created_at, d.updated_at, d.tags, d.retain_params,
+                       COUNT(mu.id) as unit_count
                 FROM {fq_table("documents")} d
                 LEFT JOIN {fq_table("memory_units")} mu ON mu.document_id = d.id
                 WHERE d.id = $1 AND d.bank_id = $2
-                GROUP BY d.id, d.bank_id, d.original_text, d.content_hash, d.created_at, d.updated_at, d.tags
+                GROUP BY d.id, d.bank_id, d.original_text, d.content_hash,
+                         d.created_at, d.updated_at, d.tags, d.retain_params
                 """,
                 document_id,
                 bank_id,
@@ -3495,6 +3548,14 @@ class MemoryEngine(MemoryEngineInterface):
 
             if not doc:
                 return None
+
+            retain_params_raw = doc["retain_params"]
+            retain_params_parsed = (
+                json.loads(retain_params_raw) if isinstance(retain_params_raw, str) else retain_params_raw
+            )
+
+            # document_metadata is sourced from retain_params.metadata
+            document_metadata = retain_params_parsed.get("metadata") if retain_params_parsed else None
 
             return {
                 "id": doc["id"],
@@ -3505,6 +3566,8 @@ class MemoryEngine(MemoryEngineInterface):
                 "created_at": doc["created_at"].isoformat() if doc["created_at"] else None,
                 "updated_at": doc["updated_at"].isoformat() if doc["updated_at"] else None,
                 "tags": list(doc["tags"]) if doc["tags"] else [],
+                "document_metadata": document_metadata or None,
+                "retain_params": retain_params_parsed or None,
             }
 
     async def delete_document(
@@ -3562,7 +3625,10 @@ class MemoryEngine(MemoryEngineInterface):
                 }
 
         if invalidated_obs > 0:
-            await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+            try:
+                await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+            except Exception as e:
+                logger.warning(f"Failed to submit consolidation after document deletion for bank {bank_id}: {e}")
 
         return result
 
@@ -3696,7 +3762,10 @@ class MemoryEngine(MemoryEngineInterface):
                             )
 
         if invalidated_obs > 0:
-            await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+            try:
+                await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+            except Exception as e:
+                logger.warning(f"Failed to submit consolidation after document update for bank {bank_id}: {e}")
 
         return True
 
@@ -3758,7 +3827,14 @@ class MemoryEngine(MemoryEngineInterface):
                 }
 
         if bank_id_for_consolidation:
-            await self.submit_async_consolidation(bank_id=bank_id_for_consolidation, request_context=request_context)
+            try:
+                await self.submit_async_consolidation(
+                    bank_id=bank_id_for_consolidation, request_context=request_context
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to submit consolidation after memory deletion for bank {bank_id_for_consolidation}: {e}"
+                )
 
         return result
 
@@ -3767,6 +3843,7 @@ class MemoryEngine(MemoryEngineInterface):
         bank_id: str,
         fact_type: str | None = None,
         *,
+        delete_bank_profile: bool = True,
         request_context: "RequestContext",
     ) -> dict[str, int]:
         """
@@ -3782,7 +3859,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         Args:
             bank_id: bank ID to delete
-            fact_type: Optional fact type filter (world, experience, opinion). If provided, only deletes memories of that type.
+            fact_type: Optional fact type filter (world, experience). If provided, only deletes memories of that type.
             request_context: Request context for authentication.
 
         Returns:
@@ -3853,31 +3930,35 @@ class MemoryEngine(MemoryEngineInterface):
                         # Delete entities (cascades to unit_entities, entity_cooccurrences, memory_links with entity_id)
                         await conn.execute(f"DELETE FROM {fq_table('entities')} WHERE bank_id = $1", bank_id)
 
-                        # Delete the bank profile and retrieve internal_id for HNSW index cleanup
-                        internal_id = await conn.fetchval(
-                            f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1 RETURNING internal_id", bank_id
-                        )
-                        if internal_id:
-                            bank_internal_id = str(internal_id)
-
                         result = {
                             "memory_units_deleted": units_count,
                             "entities_deleted": entities_count,
                             "documents_deleted": documents_count,
-                            "bank_deleted": True,
                         }
+
+                        if delete_bank_profile:
+                            # Delete the bank profile and retrieve internal_id for HNSW index cleanup
+                            internal_id = await conn.fetchval(
+                                f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1 RETURNING internal_id", bank_id
+                            )
+                            if internal_id:
+                                bank_internal_id = str(internal_id)
+                            result["bank_deleted"] = True
 
                 except Exception as e:
                     raise Exception(f"Failed to delete agent data: {str(e)}")
 
-            # Drop per-bank HNSW indexes AFTER the transaction commits to avoid
+            # Drop per-bank vector indexes AFTER the transaction commits to avoid
             # AccessExclusiveLock deadlocks with concurrent bank deletions.
             # (DROP INDEX on memory_units conflicts with RowExclusiveLock from DELETE inside tx)
             if bank_internal_id:
-                await bank_utils.drop_bank_hnsw_indexes(conn, bank_internal_id)
+                await bank_utils.drop_bank_vector_indexes(conn, bank_internal_id)
 
         if invalidated_obs > 0:
-            await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+            try:
+                await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+            except Exception as e:
+                logger.warning(f"Failed to submit consolidation after bank deletion for bank {bank_id}: {e}")
 
         return result
 
@@ -4100,7 +4181,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         Args:
             bank_id: Filter by bank ID
-            fact_type: Filter by fact type (world, experience, opinion)
+            fact_type: Filter by fact type (world, experience)
             limit: Maximum number of items to return (default: 1000)
             q: Full-text search query (searches text and context fields)
             tags: Filter by tags
@@ -4186,23 +4267,27 @@ class MemoryEngine(MemoryEngineInterface):
                     source_memory_ids.extend(unit["source_memory_ids"])
             source_memory_ids = list(set(source_memory_ids))  # Deduplicate
 
-            # Fetch links involving both visible units AND source memories
+            # Fetch links where BOTH endpoints are in the visible set (or source memories)
+            # Cap at 10k edges — the UI can't usefully render more, and uncapped queries
+            # on highly-connected graphs (e.g. 1000 nodes with 500k+ edges) are too slow.
+            max_edges = 10000
             all_relevant_ids = unit_ids + source_memory_ids
             if all_relevant_ids:
                 links = await conn.fetch(
                     f"""
-                    SELECT DISTINCT ON (LEAST(ml.from_unit_id, ml.to_unit_id), GREATEST(ml.from_unit_id, ml.to_unit_id), ml.link_type, COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid))
-                        ml.from_unit_id,
-                        ml.to_unit_id,
-                        ml.link_type,
-                        ml.weight,
-                        e.canonical_name as entity_name
+                    SELECT ml.from_unit_id,
+                           ml.to_unit_id,
+                           ml.link_type,
+                           ml.weight,
+                           e.canonical_name as entity_name
                     FROM {fq_table("memory_links")} ml
                     LEFT JOIN {fq_table("entities")} e ON ml.entity_id = e.id
-                    WHERE ml.from_unit_id = ANY($1::uuid[]) OR ml.to_unit_id = ANY($1::uuid[])
-                    ORDER BY LEAST(ml.from_unit_id, ml.to_unit_id), GREATEST(ml.from_unit_id, ml.to_unit_id), ml.link_type, COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid), ml.weight DESC
+                    WHERE ml.from_unit_id = ANY($1::uuid[]) AND ml.to_unit_id = ANY($1::uuid[])
+                    ORDER BY ml.weight DESC NULLS LAST
+                    LIMIT $2
                 """,
                     all_relevant_ids,
+                    max_edges,
                 )
             else:
                 links = []
@@ -4263,13 +4348,23 @@ class MemoryEngine(MemoryEngineInterface):
                 link for link in links if link["from_unit_id"] in unit_id_set and link["to_unit_id"] in unit_id_set
             ]
 
-            # Get entity information
-            unit_entities = await conn.fetch(f"""
-                SELECT ue.unit_id, e.canonical_name
-                FROM {fq_table("unit_entities")} ue
-                JOIN {fq_table("entities")} e ON ue.entity_id = e.id
-                ORDER BY ue.unit_id
-            """)
+            # Get entity information — only for visible units
+            # Fetch entities for visible units AND their source memories
+            # (so observations can inherit entities from source memories)
+            entity_lookup_ids = unit_ids + source_memory_ids
+            if entity_lookup_ids:
+                unit_entities = await conn.fetch(
+                    f"""
+                    SELECT ue.unit_id, e.canonical_name
+                    FROM {fq_table("unit_entities")} ue
+                    JOIN {fq_table("entities")} e ON ue.entity_id = e.id
+                    WHERE ue.unit_id = ANY($1::uuid[])
+                    ORDER BY ue.unit_id
+                """,
+                    entity_lookup_ids,
+                )
+            else:
+                unit_entities = []
 
         # Build entity mapping
         entity_map = {}
@@ -4467,7 +4562,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         Args:
             bank_id: Filter by bank ID
-            fact_type: Filter by fact type (world, experience, opinion)
+            fact_type: Filter by fact type (world, experience)
             search_query: Full-text search query (searches text and context fields)
             limit: Maximum number of results to return
             offset: Offset for pagination
@@ -4924,6 +5019,14 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id_val = row["bank_id"]
                 unit_count = count_map.get((doc_id, bank_id_val), 0)
 
+                retain_params_val = row["retain_params"]
+                retain_params_val = (
+                    json.loads(retain_params_val) if isinstance(retain_params_val, str) else retain_params_val
+                )
+
+                # document_metadata is sourced from retain_params.metadata
+                document_metadata = retain_params_val.get("metadata") if retain_params_val else None
+
                 items.append(
                     {
                         "id": doc_id,
@@ -4933,7 +5036,8 @@ class MemoryEngine(MemoryEngineInterface):
                         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else "",
                         "text_length": row["text_length"] or 0,
                         "memory_unit_count": unit_count,
-                        "retain_params": row["retain_params"] if row["retain_params"] else None,
+                        "retain_params": retain_params_val or None,
+                        "document_metadata": document_metadata or None,
                         "tags": row["tags"] if row["tags"] else [],
                     }
                 )
@@ -5826,14 +5930,16 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id,
             )
 
-            # Single query for all link stats — avoids triple join on memory_links (can be 21M+ rows).
-            # link_counts and link_counts_by_fact_type are derived in Python from the breakdown.
+            # Link stats — filter on ml.bank_id (indexed) instead of joining through mu.bank_id.
+            # With the idx_memory_links_bank_link_type index this turns a full-table hash join
+            # into an indexed scan + PK lookups.  link_counts and link_counts_by_fact_type are
+            # derived in Python from the breakdown.
             link_breakdown_stats = await conn.fetch(
                 f"""
                 SELECT mu.fact_type, ml.link_type, COUNT(*) as count
                 FROM {fq_table("memory_links")} ml
                 JOIN {fq_table("memory_units")} mu ON ml.from_unit_id = mu.id
-                WHERE mu.bank_id = $1
+                WHERE ml.bank_id = $1
                 GROUP BY mu.fact_type, ml.link_type
                 """,
                 bank_id,
@@ -6255,6 +6361,7 @@ class MemoryEngine(MemoryEngineInterface):
         *,
         tags: list[str] | None = None,
         tags_match: str = "any",
+        detail: str = "full",
         limit: int = 100,
         offset: int = 0,
         request_context: "RequestContext",
@@ -6265,6 +6372,7 @@ class MemoryEngine(MemoryEngineInterface):
             bank_id: Bank identifier
             tags: Optional tags to filter by
             tags_match: How to match tags - 'any', 'all', or 'exact'
+            detail: Detail level - 'metadata', 'content', or 'full'
             limit: Maximum number of results
             offset: Offset for pagination
             request_context: Request context for authentication
@@ -6306,13 +6414,14 @@ class MemoryEngine(MemoryEngineInterface):
                 *params,
             )
 
-            return [self._row_to_mental_model(row) for row in rows]
+            return [self._row_to_mental_model(row, detail=detail) for row in rows]
 
     async def get_mental_model(
         self,
         bank_id: str,
         mental_model_id: str,
         *,
+        detail: str = "full",
         request_context: "RequestContext",
     ) -> dict[str, Any] | None:
         """Get a single pinned mental model by ID.
@@ -6320,6 +6429,7 @@ class MemoryEngine(MemoryEngineInterface):
         Args:
             bank_id: Bank identifier
             mental_model_id: Pinned mental model UUID
+            detail: Detail level - 'metadata', 'content', or 'full'
             request_context: Request context for authentication
 
         Returns:
@@ -6353,7 +6463,7 @@ class MemoryEngine(MemoryEngineInterface):
                 mental_model_id,
             )
 
-            result = self._row_to_mental_model(row) if row else None
+            result = self._row_to_mental_model(row, detail=detail) if row else None
 
         # Post-operation hook (usage recording)
         if result and self._operation_validator:
@@ -6528,17 +6638,13 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Create parent span for mental model refresh operation
         with create_operation_span("mental_model_refresh", bank_id):
-            # SECURITY: If the mental model has tags, pass them to reflect with "all_strict" matching
-            # to ensure it can only access other mental models/memories with the SAME tags.
-            # This prevents cross-tenant/cross-user information leakage by excluding untagged content.
-            tags = mental_model.get("tags")
-            tags_match = "all_strict" if tags else "any"
-
             # Read reflect options from trigger (if stored)
             trigger_data = mental_model.get("trigger") or {}
             fact_types = trigger_data.get("fact_types")
             exclude_mental_models = trigger_data.get("exclude_mental_models", False)
             stored_exclude_ids: list[str] = trigger_data.get("exclude_mental_model_ids") or []
+
+            tag_filtering = _resolve_refresh_tag_filtering(mental_model.get("tags"), trigger_data)
 
             # Run reflect with the source query, excluding the mental model being refreshed
             # Skip creating a nested "hindsight.reflect" span since we already have "hindsight.mental_model_refresh"
@@ -6546,8 +6652,9 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id,
                 query=mental_model["source_query"],
                 request_context=request_context,
-                tags=tags,
-                tags_match=tags_match,
+                tags=tag_filtering.tags,
+                tags_match=tag_filtering.tags_match,
+                tag_groups=tag_filtering.tag_groups,
                 fact_types=fact_types,
                 exclude_mental_models=exclude_mental_models,
                 exclude_mental_model_ids=list({*stored_exclude_ids, mental_model_id}),
@@ -6754,34 +6861,45 @@ class MemoryEngine(MemoryEngineInterface):
 
         return result == "DELETE 1"
 
-    def _row_to_mental_model(self, row) -> dict[str, Any]:
-        """Convert a database row to a mental model dict."""
-        reflect_response = row.get("reflect_response")
-        # Parse JSON string to dict if needed (asyncpg may return JSONB as string)
-        if isinstance(reflect_response, str):
-            try:
-                reflect_response = json.loads(reflect_response)
-            except json.JSONDecodeError:
-                reflect_response = None
+    def _row_to_mental_model(self, row, *, detail: str = "full") -> dict[str, Any]:
+        """Convert a database row to a mental model dict.
+
+        Args:
+            row: Database row
+            detail: Detail level - 'metadata', 'content', or 'full'
+        """
+        result: dict[str, Any] = {
+            "id": str(row["id"]),
+            "bank_id": row["bank_id"],
+            "name": row["name"],
+            "tags": row["tags"] or [],
+            "last_refreshed_at": row["last_refreshed_at"].isoformat() if row["last_refreshed_at"] else None,
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        if detail == "metadata":
+            return result
+
         trigger = row.get("trigger")
         if isinstance(trigger, str):
             try:
                 trigger = json.loads(trigger)
             except json.JSONDecodeError:
                 trigger = None
-        return {
-            "id": str(row["id"]),
-            "bank_id": row["bank_id"],
-            "name": row["name"],
-            "source_query": row["source_query"],
-            "content": row["content"],
-            "tags": row["tags"] or [],
-            "max_tokens": row.get("max_tokens"),
-            "trigger": trigger,
-            "last_refreshed_at": row["last_refreshed_at"].isoformat() if row["last_refreshed_at"] else None,
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            "reflect_response": reflect_response,
-        }
+        result["source_query"] = row["source_query"]
+        result["content"] = row["content"]
+        result["max_tokens"] = row.get("max_tokens")
+        result["trigger"] = trigger
+
+        if detail == "full":
+            reflect_response = row.get("reflect_response")
+            if isinstance(reflect_response, str):
+                try:
+                    reflect_response = json.loads(reflect_response)
+                except json.JSONDecodeError:
+                    reflect_response = None
+            result["reflect_response"] = reflect_response
+
+        return result
 
     # =========================================================================
     # Directives - Hard rules injected into prompts

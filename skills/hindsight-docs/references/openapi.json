@@ -10,7 +10,7 @@
       "name": "Apache 2.0",
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
-    "version": "0.4.20"
+    "version": "0.4.22"
   },
   "paths": {
     "/health": {
@@ -972,6 +972,23 @@
             "description": "How to match tags"
           },
           {
+            "name": "detail",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "metadata",
+                "content",
+                "full"
+              ],
+              "type": "string",
+              "description": "Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)",
+              "default": "full",
+              "title": "Detail"
+            },
+            "description": "Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)"
+          },
+          {
             "name": "limit",
             "in": "query",
             "required": false,
@@ -1128,6 +1145,23 @@
               "type": "string",
               "title": "Mental Model Id"
             }
+          },
+          {
+            "name": "detail",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "metadata",
+                "content",
+                "full"
+              ],
+              "type": "string",
+              "description": "Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)",
+              "default": "full",
+              "title": "Detail"
+            },
+            "description": "Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)"
           },
           {
             "name": "authorization",
@@ -3066,6 +3100,156 @@
         }
       }
     },
+    "/v1/default/banks/{bank_id}/import": {
+      "post": {
+        "tags": [
+          "Bank Templates"
+        ],
+        "summary": "Import bank template",
+        "description": "Import a bank template manifest to create or update a bank's configuration, mental models, and directives. If the bank does not exist it is created. Config fields are applied as per-bank overrides. Mental models are matched by id, directives by name \u2014 existing ones are updated, new ones are created. Use dry_run=true to validate the manifest without applying changes.",
+        "operationId": "import_bank_template",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Validate only, do not apply changes",
+              "default": false,
+              "title": "Dry Run"
+            },
+            "description": "Validate only, do not apply changes"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BankTemplateImportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/default/banks/{bank_id}/export": {
+      "get": {
+        "tags": [
+          "Bank Templates"
+        ],
+        "summary": "Export bank template",
+        "description": "Export a bank's current configuration, mental models, and directives as a template manifest. The exported manifest can be imported into another bank to replicate the setup.",
+        "operationId": "export_bank_template",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BankTemplateManifest"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bank-template-schema": {
+      "get": {
+        "tags": [
+          "Bank Templates"
+        ],
+        "summary": "Get bank template JSON Schema",
+        "description": "Returns the JSON Schema for the bank template manifest format. Use this to validate template manifests before importing.",
+        "operationId": "get_bank_template_schema",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/default/banks/{bank_id}/observations": {
       "delete": {
         "tags": [
@@ -4075,6 +4259,253 @@
           }
         }
       }
+    },
+    "/v1/default/banks/{bank_id}/audit-logs": {
+      "get": {
+        "tags": [
+          "Audit"
+        ],
+        "summary": "List audit logs",
+        "description": "List audit log entries for a bank, ordered by most recent first.",
+        "operationId": "list_audit_logs",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "action",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by action type",
+              "title": "Action"
+            },
+            "description": "Filter by action type"
+          },
+          {
+            "name": "transport",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by transport (http, mcp, system)",
+              "title": "Transport"
+            },
+            "description": "Filter by transport (http, mcp, system)"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter from this ISO datetime (inclusive)",
+              "title": "Start Date"
+            },
+            "description": "Filter from this ISO datetime (inclusive)"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter until this ISO datetime (exclusive)",
+              "title": "End Date"
+            },
+            "description": "Filter until this ISO datetime (exclusive)"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "description": "Max items to return",
+              "default": 50,
+              "title": "Limit"
+            },
+            "description": "Max items to return"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Offset for pagination",
+              "default": 0,
+              "title": "Offset"
+            },
+            "description": "Offset for pagination"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditLogListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/default/banks/{bank_id}/audit-logs/stats": {
+      "get": {
+        "tags": [
+          "Audit"
+        ],
+        "summary": "Audit log statistics",
+        "description": "Get audit log counts grouped by time bucket for charting.",
+        "operationId": "audit_log_stats",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "action",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by action type",
+              "title": "Action"
+            },
+            "description": "Filter by action type"
+          },
+          {
+            "name": "period",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Time period: 1d, 7d, or 30d",
+              "default": "7d",
+              "title": "Period"
+            },
+            "description": "Time period: 1d, 7d, or 30d"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditLogStatsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -4126,6 +4557,211 @@
           "operation_id": "550e8400-e29b-41d4-a716-446655440000",
           "status": "queued"
         }
+      },
+      "AuditLogEntry": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "action": {
+            "type": "string",
+            "title": "Action"
+          },
+          "transport": {
+            "type": "string",
+            "title": "Transport"
+          },
+          "bank_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bank Id"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms",
+            "description": "Server-computed duration in milliseconds (started_at \u2192 ended_at). Null if not yet completed."
+          },
+          "request": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request"
+          },
+          "response": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "action",
+          "transport",
+          "bank_id",
+          "started_at",
+          "ended_at",
+          "request",
+          "response",
+          "metadata"
+        ],
+        "title": "AuditLogEntry",
+        "description": "A single audit log entry."
+      },
+      "AuditLogListResponse": {
+        "properties": {
+          "bank_id": {
+            "type": "string",
+            "title": "Bank Id"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AuditLogEntry"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "bank_id",
+          "total",
+          "limit",
+          "offset",
+          "items"
+        ],
+        "title": "AuditLogListResponse",
+        "description": "Response model for list audit logs endpoint."
+      },
+      "AuditLogStatsBucket": {
+        "properties": {
+          "time": {
+            "type": "string",
+            "title": "Time"
+          },
+          "actions": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Actions"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "time",
+          "actions",
+          "total"
+        ],
+        "title": "AuditLogStatsBucket",
+        "description": "A single time bucket in audit log stats."
+      },
+      "AuditLogStatsResponse": {
+        "properties": {
+          "bank_id": {
+            "type": "string",
+            "title": "Bank Id"
+          },
+          "period": {
+            "type": "string",
+            "title": "Period"
+          },
+          "trunc": {
+            "type": "string",
+            "title": "Trunc"
+          },
+          "start": {
+            "type": "string",
+            "title": "Start"
+          },
+          "buckets": {
+            "items": {
+              "$ref": "#/components/schemas/AuditLogStatsBucket"
+            },
+            "type": "array",
+            "title": "Buckets"
+          }
+        },
+        "type": "object",
+        "required": [
+          "bank_id",
+          "period",
+          "trunc",
+          "start",
+          "buckets"
+        ],
+        "title": "AuditLogStatsResponse",
+        "description": "Response model for audit log stats endpoint."
       },
       "BackgroundResponse": {
         "properties": {
@@ -4506,6 +5142,411 @@
           "total_nodes": 150,
           "total_observations": 45
         }
+      },
+      "BankTemplateConfig": {
+        "properties": {
+          "reflect_mission": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reflect Mission",
+            "description": "Mission/context for Reflect operations"
+          },
+          "retain_mission": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retain Mission",
+            "description": "Steers what gets extracted during retain"
+          },
+          "retain_extraction_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retain Extraction Mode",
+            "description": "Fact extraction mode: 'concise' (default), 'verbose', or 'custom'"
+          },
+          "retain_custom_instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retain Custom Instructions",
+            "description": "Custom extraction prompt (when mode='custom')"
+          },
+          "retain_chunk_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retain Chunk Size",
+            "description": "Max token size for each content chunk"
+          },
+          "enable_observations": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enable Observations",
+            "description": "Toggle observation consolidation"
+          },
+          "observations_mission": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observations Mission",
+            "description": "Controls what gets synthesised"
+          },
+          "disposition_skepticism": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 5.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disposition Skepticism",
+            "description": "Skepticism trait (1-5)"
+          },
+          "disposition_literalism": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 5.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disposition Literalism",
+            "description": "Literalism trait (1-5)"
+          },
+          "disposition_empathy": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 5.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disposition Empathy",
+            "description": "Empathy trait (1-5)"
+          },
+          "entity_labels": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entity Labels",
+            "description": "Controlled vocabulary for entity labels"
+          },
+          "entities_allow_free_form": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entities Allow Free Form",
+            "description": "Allow entities outside the label vocabulary"
+          }
+        },
+        "type": "object",
+        "title": "BankTemplateConfig",
+        "description": "Bank configuration fields within a template manifest.\n\nOnly includes configurable (per-bank) fields. Credential fields\n(API keys, base URLs) are intentionally excluded for security."
+      },
+      "BankTemplateDirective": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "Human-readable name for the directive (used as match key on re-import)"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content",
+            "description": "The directive text to inject into prompts"
+          },
+          "priority": {
+            "type": "integer",
+            "title": "Priority",
+            "description": "Higher priority directives are injected first",
+            "default": 0
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active",
+            "description": "Whether this directive is active",
+            "default": true
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tags",
+            "description": "Tags for filtering",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "content"
+        ],
+        "title": "BankTemplateDirective",
+        "description": "A directive definition within a bank template manifest.\n\nDirectives are matched by name on re-import: existing directives\nwith the same name are updated, new ones are created."
+      },
+      "BankTemplateImportResponse": {
+        "properties": {
+          "bank_id": {
+            "type": "string",
+            "title": "Bank Id",
+            "description": "Bank that was imported into"
+          },
+          "config_applied": {
+            "type": "boolean",
+            "title": "Config Applied",
+            "description": "Whether bank config was updated"
+          },
+          "mental_models_created": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Mental Models Created",
+            "description": "IDs of newly created mental models",
+            "default": []
+          },
+          "mental_models_updated": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Mental Models Updated",
+            "description": "IDs of updated mental models",
+            "default": []
+          },
+          "directives_created": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Directives Created",
+            "description": "Names of newly created directives",
+            "default": []
+          },
+          "directives_updated": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Directives Updated",
+            "description": "Names of updated directives",
+            "default": []
+          },
+          "operation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Operation Ids",
+            "description": "Operation IDs for mental model content generation (async)",
+            "default": []
+          },
+          "dry_run": {
+            "type": "boolean",
+            "title": "Dry Run",
+            "description": "True if this was a validation-only run",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "bank_id",
+          "config_applied"
+        ],
+        "title": "BankTemplateImportResponse",
+        "description": "Response model for the bank template import endpoint."
+      },
+      "BankTemplateManifest": {
+        "properties": {
+          "version": {
+            "type": "string",
+            "title": "Version",
+            "description": "Manifest schema version (currently '1')"
+          },
+          "bank": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BankTemplateConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Bank configuration to apply. Omit to leave config unchanged."
+          },
+          "mental_models": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BankTemplateMentalModel"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mental Models",
+            "description": "Mental models to create or update (matched by id). Omit to leave unchanged."
+          },
+          "directives": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BankTemplateDirective"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Directives",
+            "description": "Directives to create or update (matched by name). Omit to leave unchanged."
+          }
+        },
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "title": "BankTemplateManifest",
+        "description": "A bank template manifest for import/export.\n\nVersion field enables forward-compatible schema evolution: the API\nauto-upgrades older manifest versions to the current schema on import.",
+        "example": {
+          "bank": {
+            "disposition_empathy": 5,
+            "enable_observations": true,
+            "reflect_mission": "You are helping a support agent remember customer interactions.",
+            "retain_mission": "Extract customer issues, resolutions, and sentiment."
+          },
+          "directives": [
+            {
+              "content": "Always respond with empathy and understanding.",
+              "name": "Always be empathetic",
+              "priority": 10
+            }
+          ],
+          "mental_models": [
+            {
+              "id": "sentiment-overview",
+              "name": "Customer Sentiment Overview",
+              "source_query": "What is the overall sentiment trend?",
+              "trigger": {
+                "refresh_after_consolidation": true
+              }
+            }
+          ],
+          "version": "1"
+        }
+      },
+      "BankTemplateMentalModel": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id",
+            "description": "Unique ID for the mental model (alphanumeric lowercase with hyphens)"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "Human-readable name for the mental model"
+          },
+          "source_query": {
+            "type": "string",
+            "title": "Source Query",
+            "description": "The query to run to generate content"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tags",
+            "description": "Tags for scoped visibility",
+            "default": []
+          },
+          "max_tokens": {
+            "type": "integer",
+            "maximum": 8192.0,
+            "minimum": 256.0,
+            "title": "Max Tokens",
+            "description": "Maximum tokens for generated content",
+            "default": 2048
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/MentalModelTrigger-Output",
+            "description": "Trigger settings",
+            "default": {}
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "source_query"
+        ],
+        "title": "BankTemplateMentalModel",
+        "description": "A mental model definition within a bank template manifest."
       },
       "Body_file_retain": {
         "properties": {
@@ -5018,7 +6059,7 @@
             "default": 2048
           },
           "trigger": {
-            "$ref": "#/components/schemas/MentalModelTrigger",
+            "$ref": "#/components/schemas/MentalModelTrigger-Input",
             "description": "Trigger settings",
             "default": {}
           }
@@ -5363,6 +6404,32 @@
             "title": "Tags",
             "description": "Tags associated with this document",
             "default": []
+          },
+          "document_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document Metadata",
+            "description": "Document metadata"
+          },
+          "retain_params": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retain Params",
+            "description": "Parameters used during retain"
           }
         },
         "type": "object",
@@ -5381,9 +6448,17 @@
           "bank_id": "user123",
           "content_hash": "abc123",
           "created_at": "2024-01-15T10:30:00Z",
+          "document_metadata": {
+            "channel": "#general",
+            "source": "slack"
+          },
           "id": "session_1",
           "memory_unit_count": 15,
           "original_text": "Full document text here...",
+          "retain_params": {
+            "context": "Team meeting notes",
+            "event_date": "2024-01-15"
+          },
           "tags": [
             "user_a",
             "session_123"
@@ -6220,11 +7295,25 @@
             "title": "Name"
           },
           "source_query": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Source Query"
           },
           "content": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Content",
             "description": "The mental model content as well-formatted markdown (auto-generated from reflect endpoint)"
           },
@@ -6237,13 +7326,25 @@
             "default": []
           },
           "max_tokens": {
-            "type": "integer",
-            "title": "Max Tokens",
-            "default": 2048
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Tokens"
           },
           "trigger": {
-            "$ref": "#/components/schemas/MentalModelTrigger",
-            "default": {}
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MentalModelTrigger-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "last_refreshed_at": {
             "anyOf": [
@@ -6285,14 +7386,12 @@
         "required": [
           "id",
           "bank_id",
-          "name",
-          "source_query",
-          "content"
+          "name"
         ],
         "title": "MentalModelResponse",
         "description": "Response model for a mental model (stored reflect response)."
       },
-      "MentalModelTrigger": {
+      "MentalModelTrigger-Input": {
         "properties": {
           "refresh_after_consolidation": {
             "type": "boolean",
@@ -6340,6 +7439,152 @@
             ],
             "title": "Exclude Mental Model Ids",
             "description": "Exclude specific mental models by ID from the reflect loop."
+          },
+          "tags_match": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "any",
+                  "all",
+                  "any_strict",
+                  "all_strict"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tags Match",
+            "description": "Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Set to 'any' to include untagged memories alongside tagged ones during refresh."
+          },
+          "tag_groups": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TagGroupLeaf"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TagGroupAnd-Input"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TagGroupOr-Input"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TagGroupNot-Input"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tag Groups",
+            "description": "Compound boolean tag expressions to use during refresh instead of the model's own tags. When set, these tag groups are passed to reflect and the model's flat tags are NOT used for filtering. Supports nested and/or/not expressions for complex tag-based scoping."
+          }
+        },
+        "type": "object",
+        "title": "MentalModelTrigger",
+        "description": "Trigger settings for a mental model."
+      },
+      "MentalModelTrigger-Output": {
+        "properties": {
+          "refresh_after_consolidation": {
+            "type": "boolean",
+            "title": "Refresh After Consolidation",
+            "description": "If true, refresh this mental model after observations consolidation (real-time mode)",
+            "default": false
+          },
+          "fact_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "world",
+                    "experience",
+                    "observation"
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fact Types",
+            "description": "Filter which fact types are retrieved during reflect. None means all types (world, experience, observation)."
+          },
+          "exclude_mental_models": {
+            "type": "boolean",
+            "title": "Exclude Mental Models",
+            "description": "If true, exclude all mental models from the reflect loop (skip search_mental_models tool).",
+            "default": false
+          },
+          "exclude_mental_model_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exclude Mental Model Ids",
+            "description": "Exclude specific mental models by ID from the reflect loop."
+          },
+          "tags_match": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "any",
+                  "all",
+                  "any_strict",
+                  "all_strict"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tags Match",
+            "description": "Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Set to 'any' to include untagged memories alongside tagged ones during refresh."
+          },
+          "tag_groups": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TagGroupLeaf"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TagGroupAnd-Output"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TagGroupOr-Output"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TagGroupNot-Output"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tag Groups",
+            "description": "Compound boolean tag expressions to use during refresh instead of the model's own tags. When set, these tag groups are passed to reflect and the model's flat tags are NOT used for filtering. Supports nested and/or/not expressions for complex tag-based scoping."
           }
         },
         "type": "object",
@@ -6665,13 +7910,13 @@
                       "$ref": "#/components/schemas/TagGroupLeaf"
                     },
                     {
-                      "$ref": "#/components/schemas/TagGroupAnd"
+                      "$ref": "#/components/schemas/TagGroupAnd-Input"
                     },
                     {
-                      "$ref": "#/components/schemas/TagGroupOr"
+                      "$ref": "#/components/schemas/TagGroupOr-Input"
                     },
                     {
-                      "$ref": "#/components/schemas/TagGroupNot"
+                      "$ref": "#/components/schemas/TagGroupNot-Input"
                     }
                   ]
                 },
@@ -7322,13 +8567,13 @@
                       "$ref": "#/components/schemas/TagGroupLeaf"
                     },
                     {
-                      "$ref": "#/components/schemas/TagGroupAnd"
+                      "$ref": "#/components/schemas/TagGroupAnd-Input"
                     },
                     {
-                      "$ref": "#/components/schemas/TagGroupOr"
+                      "$ref": "#/components/schemas/TagGroupOr-Input"
                     },
                     {
-                      "$ref": "#/components/schemas/TagGroupNot"
+                      "$ref": "#/components/schemas/TagGroupNot-Input"
                     }
                   ]
                 },
@@ -7788,7 +9033,7 @@
         "title": "SourceFactsIncludeOptions",
         "description": "Options for including source facts for observation-type results."
       },
-      "TagGroupAnd": {
+      "TagGroupAnd-Input": {
         "properties": {
           "and": {
             "items": {
@@ -7797,13 +9042,43 @@
                   "$ref": "#/components/schemas/TagGroupLeaf"
                 },
                 {
-                  "$ref": "#/components/schemas/TagGroupAnd"
+                  "$ref": "#/components/schemas/TagGroupAnd-Input"
                 },
                 {
-                  "$ref": "#/components/schemas/TagGroupOr"
+                  "$ref": "#/components/schemas/TagGroupOr-Input"
                 },
                 {
-                  "$ref": "#/components/schemas/TagGroupNot"
+                  "$ref": "#/components/schemas/TagGroupNot-Input"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "And"
+          }
+        },
+        "type": "object",
+        "required": [
+          "and"
+        ],
+        "title": "TagGroupAnd",
+        "description": "Compound AND group: all child filters must match."
+      },
+      "TagGroupAnd-Output": {
+        "properties": {
+          "and": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TagGroupLeaf"
+                },
+                {
+                  "$ref": "#/components/schemas/TagGroupAnd-Output"
+                },
+                {
+                  "$ref": "#/components/schemas/TagGroupOr-Output"
+                },
+                {
+                  "$ref": "#/components/schemas/TagGroupNot-Output"
                 }
               ]
             },
@@ -7846,7 +9121,7 @@
         "title": "TagGroupLeaf",
         "description": "A leaf tag filter: matches memories by tag list and match mode."
       },
-      "TagGroupNot": {
+      "TagGroupNot-Input": {
         "properties": {
           "not": {
             "anyOf": [
@@ -7854,13 +9129,13 @@
                 "$ref": "#/components/schemas/TagGroupLeaf"
               },
               {
-                "$ref": "#/components/schemas/TagGroupAnd"
+                "$ref": "#/components/schemas/TagGroupAnd-Input"
               },
               {
-                "$ref": "#/components/schemas/TagGroupOr"
+                "$ref": "#/components/schemas/TagGroupOr-Input"
               },
               {
-                "$ref": "#/components/schemas/TagGroupNot"
+                "$ref": "#/components/schemas/TagGroupNot-Input"
               }
             ],
             "title": "Not"
@@ -7873,7 +9148,34 @@
         "title": "TagGroupNot",
         "description": "Compound NOT group: child filter must NOT match."
       },
-      "TagGroupOr": {
+      "TagGroupNot-Output": {
+        "properties": {
+          "not": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TagGroupLeaf"
+              },
+              {
+                "$ref": "#/components/schemas/TagGroupAnd-Output"
+              },
+              {
+                "$ref": "#/components/schemas/TagGroupOr-Output"
+              },
+              {
+                "$ref": "#/components/schemas/TagGroupNot-Output"
+              }
+            ],
+            "title": "Not"
+          }
+        },
+        "type": "object",
+        "required": [
+          "not"
+        ],
+        "title": "TagGroupNot",
+        "description": "Compound NOT group: child filter must NOT match."
+      },
+      "TagGroupOr-Input": {
         "properties": {
           "or": {
             "items": {
@@ -7882,13 +9184,43 @@
                   "$ref": "#/components/schemas/TagGroupLeaf"
                 },
                 {
-                  "$ref": "#/components/schemas/TagGroupAnd"
+                  "$ref": "#/components/schemas/TagGroupAnd-Input"
                 },
                 {
-                  "$ref": "#/components/schemas/TagGroupOr"
+                  "$ref": "#/components/schemas/TagGroupOr-Input"
                 },
                 {
-                  "$ref": "#/components/schemas/TagGroupNot"
+                  "$ref": "#/components/schemas/TagGroupNot-Input"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Or"
+          }
+        },
+        "type": "object",
+        "required": [
+          "or"
+        ],
+        "title": "TagGroupOr",
+        "description": "Compound OR group: at least one child filter must match."
+      },
+      "TagGroupOr-Output": {
+        "properties": {
+          "or": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TagGroupLeaf"
+                },
+                {
+                  "$ref": "#/components/schemas/TagGroupAnd-Output"
+                },
+                {
+                  "$ref": "#/components/schemas/TagGroupOr-Output"
+                },
+                {
+                  "$ref": "#/components/schemas/TagGroupNot-Output"
                 }
               ]
             },
@@ -8148,7 +9480,7 @@
           "trigger": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/MentalModelTrigger"
+                "$ref": "#/components/schemas/MentalModelTrigger-Input"
               },
               {
                 "type": "null"
@@ -8265,6 +9597,17 @@
           "type": {
             "type": "string",
             "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "url": {
+            "title": "URL",
+            "type": "string"
           }
         },
         "type": "object",

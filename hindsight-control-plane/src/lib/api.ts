@@ -39,6 +39,48 @@ export interface WebhookDelivery {
   updated_at: string | null;
 }
 
+export interface AuditLogEntry {
+  id: string;
+  action: string;
+  transport: string;
+  bank_id: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  request: Record<string, unknown> | null;
+  response: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface AuditLogsResponse {
+  bank_id: string;
+  total: number;
+  limit: number;
+  offset: number;
+  items: AuditLogEntry[];
+}
+
+export interface AuditStatsBucket {
+  time: string;
+  actions: Record<string, number>;
+  total: number;
+}
+
+export interface AuditStatsResponse {
+  bank_id: string;
+  period: string;
+  trunc: string;
+  start: string;
+  buckets: AuditStatsBucket[];
+}
+
+export type TagsMatch = "any" | "all" | "any_strict" | "all_strict";
+
+export type TagGroup =
+  | { tags: string[]; match?: TagsMatch }
+  | { and: TagGroup[] }
+  | { or: TagGroup[] }
+  | { not: TagGroup };
+
 export interface MentalModel {
   id: string;
   bank_id: string;
@@ -52,10 +94,21 @@ export interface MentalModel {
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
     exclude_mental_model_ids?: string[];
+    tags_match?: TagsMatch;
+    tag_groups?: TagGroup[];
   };
   last_refreshed_at: string;
   created_at: string;
   reflect_response?: any;
+}
+
+export interface BankTemplateImportResponse {
+  bank_id: string;
+  config_applied: boolean;
+  mental_models_created: string[];
+  mental_models_updated: string[];
+  operation_ids: string[];
+  dry_run: boolean;
 }
 
 export class ControlPlaneClient {
@@ -149,6 +202,24 @@ export class ControlPlaneClient {
       method: "POST",
       body: JSON.stringify({ bank_id: bankId }),
     });
+  }
+
+  /**
+   * Import a bank template manifest
+   */
+  async importBankTemplate(bankId: string, manifest: Record<string, unknown>, dryRun = false) {
+    const params = dryRun ? "?dry_run=true" : "";
+    return this.fetchApi<BankTemplateImportResponse>(`/api/banks/${bankId}/import${params}`, {
+      method: "POST",
+      body: JSON.stringify(manifest),
+    });
+  }
+
+  /**
+   * Export a bank as a template manifest
+   */
+  async exportBankTemplate(bankId: string) {
+    return this.fetchApi<Record<string, unknown>>(`/api/banks/${bankId}/export`);
   }
 
   /**
@@ -770,6 +841,8 @@ export class ControlPlaneClient {
           fact_types?: Array<"world" | "experience" | "observation">;
           exclude_mental_models?: boolean;
           exclude_mental_model_ids?: string[];
+          tags_match?: TagsMatch;
+          tag_groups?: TagGroup[];
         };
         last_refreshed_at: string;
         created_at: string;
@@ -798,6 +871,8 @@ export class ControlPlaneClient {
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
         exclude_mental_model_ids?: string[];
+        tags_match?: TagsMatch;
+        tag_groups?: TagGroup[];
       };
     }
   ) {
@@ -832,6 +907,8 @@ export class ControlPlaneClient {
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
         exclude_mental_model_ids?: string[];
+        tags_match?: TagsMatch;
+        tag_groups?: TagGroup[];
       };
     }
   ) {
@@ -848,6 +925,8 @@ export class ControlPlaneClient {
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
         exclude_mental_model_ids?: string[];
+        tags_match?: TagsMatch;
+        tag_groups?: TagGroup[];
       };
       last_refreshed_at: string;
       created_at: string;
@@ -1077,6 +1156,46 @@ export class ControlPlaneClient {
     const query = params.toString();
     return this.fetchApi<{ items: WebhookDelivery[]; next_cursor: string | null }>(
       `/api/banks/${bankId}/webhooks/${webhookId}/deliveries${query ? `?${query}` : ""}`
+    );
+  }
+
+  /**
+   * List audit logs for a bank
+   */
+  async listAuditLogs(
+    bankId: string,
+    options?: {
+      action?: string;
+      transport?: string;
+      start_date?: string;
+      end_date?: string;
+      limit?: number;
+      offset?: number;
+    }
+  ): Promise<AuditLogsResponse> {
+    const params = new URLSearchParams();
+    if (options?.action) params.append("action", options.action);
+    if (options?.transport) params.append("transport", options.transport);
+    if (options?.start_date) params.append("start_date", options.start_date);
+    if (options?.end_date) params.append("end_date", options.end_date);
+    if (options?.limit) params.append("limit", options.limit.toString());
+    if (options?.offset) params.append("offset", options.offset.toString());
+    const query = params.toString();
+    return this.fetchApi<AuditLogsResponse>(
+      `/api/banks/${bankId}/audit-logs${query ? `?${query}` : ""}`
+    );
+  }
+
+  async getAuditLogStats(
+    bankId: string,
+    options?: { action?: string; period?: string }
+  ): Promise<AuditStatsResponse> {
+    const params = new URLSearchParams();
+    if (options?.action) params.append("action", options.action);
+    if (options?.period) params.append("period", options.period);
+    const query = params.toString();
+    return this.fetchApi<AuditStatsResponse>(
+      `/api/banks/${bankId}/audit-logs/stats${query ? `?${query}` : ""}`
     );
   }
 }
