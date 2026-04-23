@@ -176,6 +176,22 @@ class RetainResult:
     llm_input_tokens: int | None = None
     llm_output_tokens: int | None = None
     llm_total_tokens: int | None = None
+    # Content tokens the retain pipeline actually processed, after
+    # chunk-level content-hash deduplication. Semantics:
+    #   None — no dedup signal available (e.g. a first-time retain or a
+    #          path that doesn't compute it). Callers that care about
+    #          "what was actually new on this retain" should treat None
+    #          as "the full submitted content was processed."
+    #   0    — the entire submission was a duplicate of prior content
+    #          (all chunks matched by content_hash); nothing went
+    #          through LLM extraction.
+    #   N>0  — only N tokens of content + context went through the
+    #          extraction pipeline. The remainder was dedup'd against
+    #          existing chunks.
+    # This is the basis most billing/metering extensions want to use
+    # when the customer's client resubmits growing payloads to the same
+    # document_id (e.g. a session transcript appended to on each turn).
+    processed_content_tokens: int | None = None
 
 
 @dataclass
@@ -375,6 +391,16 @@ class OperationValidatorExtension(Extension, ABC):
         1. validate_* (pre-operation)
         2. [operation executes]
         3. on_*_complete (post-operation)
+
+    Outcomes for `validate_*` hooks:
+        - accept: return `ValidationResult.accept()` (or `accept_with(...)`)
+        - reject: return `ValidationResult.reject(reason, status_code)`
+          (raises `OperationValidationError` upstream)
+        - defer: raise `DeferOperation(exec_date, reason)` from
+          `hindsight_api.worker.exceptions` to requeue the task for a
+          future time without bumping `retry_count`. Worker-only — do
+          not raise from `validate_recall` / `validate_reflect` in
+          synchronous HTTP request paths, where it surfaces as a 500.
 
     Supported operations:
         - retain, recall, reflect (core memory operations)

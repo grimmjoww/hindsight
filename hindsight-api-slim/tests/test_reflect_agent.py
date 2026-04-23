@@ -397,6 +397,88 @@ class TestReflectAgentMocked:
         mock_functions["recall_fn"].assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_short_circuit_answer_is_capped_by_max_tokens(self, mock_llm, mock_functions):
+        """When the LLM short-circuits (returns text without calling a tool) and the text
+        exceeds max_tokens, the agent must rewrite it through a capped call so the final
+        user-visible answer respects the configured limit.
+        """
+        # Build a long response that's well over the cap in cl100k_base tokens.
+        long_answer = " ".join(
+            [
+                "This is a detailed paragraph about the team, their roles, and their recurring meetings."
+            ]
+            * 80
+        )
+        # The short-circuit path: tool_calls empty, content populated.
+        mock_llm.call_with_tools.return_value = LLMToolCallResult(
+            tool_calls=[],
+            content=long_answer,
+            finish_reason="stop",
+            input_tokens=10,
+            output_tokens=500,
+        )
+        mock_llm.call = AsyncMock(
+            return_value=(
+                "Short rewritten answer.",
+                TokenUsage(input_tokens=50, output_tokens=10, total_tokens=60),
+            )
+        )
+
+        cap = 50
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            max_tokens=cap,
+            **mock_functions,
+        )
+
+        # The rewrite call must have been made, and it must carry the cap.
+        assert mock_llm.call.await_count == 1, (
+            f"expected exactly one capped rewrite call, got {mock_llm.call.await_count}"
+        )
+        rewrite_kwargs = mock_llm.call.await_args.kwargs
+        assert rewrite_kwargs.get("max_completion_tokens") == cap, (
+            f"rewrite call should use max_completion_tokens={cap}, "
+            f"got {rewrite_kwargs.get('max_completion_tokens')}"
+        )
+
+        # The final answer is the rewritten text, not the oversized original.
+        assert result.text == "Short rewritten answer."
+
+        # The trace records the rewrite step so we can see it was invoked.
+        assert any(entry.scope == "final_rewrite" for entry in result.llm_trace), (
+            f"llm_trace should include a final_rewrite entry, got {result.llm_trace}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_answer_under_cap_is_not_rewritten(self, mock_llm, mock_functions):
+        """If the short-circuit answer already fits within max_tokens, no extra rewrite
+        call should happen — we don't want to pay for a second LLM call in the common case.
+        """
+        short_answer = "Small answer that already fits."
+        mock_llm.call_with_tools.return_value = LLMToolCallResult(
+            tool_calls=[],
+            content=short_answer,
+            finish_reason="stop",
+            input_tokens=10,
+            output_tokens=8,
+        )
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            max_tokens=200,
+            **mock_functions,
+        )
+
+        assert result.text == short_answer
+        mock_llm.call.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_max_iterations_reached(self, mock_llm, mock_functions):
         """Test that agent stops after max iterations even with errors."""
         # LLM keeps calling unknown tools
@@ -571,6 +653,52 @@ class TestContextOverflowBehavior:
         assert mock_llm.call_with_tools.call_count == 1
         # Final synthesis was called
         mock_llm.call.assert_called_once()
+
+
+class TestDirectiveLeakageOnEmptyBank:
+    """Test that directives don't leak into the answer when the bank has no data.
+
+    Uses a real LLM to verify the behaviour end-to-end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_directive_not_echoed_on_empty_bank(self, memory, request_context):
+        """When a bank has a directive but zero memories, reflect must NOT
+        parrot the directive text back as its answer.
+        """
+        import uuid
+
+        directive_text = (
+            "When making SEO or content decisions, prefer observed performance data "
+            "over industry best practices. Always check the Content Performance page "
+            "before recommending a format or approach."
+        )
+
+        bank_id = f"test-directive-leak-{uuid.uuid4().hex[:8]}"
+        try:
+            # Ensure bank exists (auto-creates it), but retain nothing.
+            await memory.get_bank_profile(bank_id, request_context=request_context)
+
+            await memory.create_directive(
+                bank_id=bank_id,
+                name="SEO Directive",
+                content=directive_text,
+                request_context=request_context,
+            )
+
+            result = await memory.reflect_async(
+                bank_id=bank_id,
+                query="What content strategy should we use?",
+                request_context=request_context,
+            )
+
+            # The directive content must NOT leak into the answer.
+            assert directive_text not in result.text, (
+                f"Directive content leaked into the answer verbatim. "
+                f"Got: {result.text!r}"
+            )
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
 
 
 class TestContextOverflowIntegration:

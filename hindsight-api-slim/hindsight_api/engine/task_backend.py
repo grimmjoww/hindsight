@@ -2,7 +2,8 @@
 Task backend for distributed task processing.
 
 This provides an abstraction for task storage and execution:
-- BrokerTaskBackend: Uses PostgreSQL as broker (production)
+- BrokerTaskBackend: Uses PostgreSQL as broker (production API servers)
+- WorkerTaskBackend: No-op submit_task (production workers — child tasks are polled)
 - SyncTaskBackend: Executes tasks immediately (testing/embedded)
 """
 
@@ -125,6 +126,33 @@ class SyncTaskBackend(TaskBackend):
         logger.debug("SyncTaskBackend shutdown")
 
 
+class WorkerTaskBackend(TaskBackend):
+    """
+    Task backend for worker processes.
+
+    Workers execute tasks directly via the poller (claim → execute), so they
+    don't need submit_task to run anything.  When engine code running *inside*
+    a worker-executed task calls submit_task (e.g. retain triggers consolidation),
+    the row has already been INSERTed into async_operations with task_payload by
+    _submit_async_operation — so submit_task is a no-op.  The new task will be
+    picked up by a worker on the next poll cycle instead of being executed inline,
+    which avoids blocking the parent task.
+    """
+
+    async def initialize(self):
+        self._initialized = True
+        logger.debug("WorkerTaskBackend initialized")
+
+    async def submit_task(self, task_dict: dict[str, Any]):
+        """No-op: the row already exists in async_operations; a worker will claim it."""
+        task_type = task_dict.get("type", "unknown")
+        logger.debug(f"WorkerTaskBackend: submit_task no-op for {task_type} (will be picked up by poller)")
+
+    async def shutdown(self):
+        self._initialized = False
+        logger.debug("WorkerTaskBackend shutdown")
+
+
 class BrokerTaskBackend(TaskBackend):
     """
     Task backend using PostgreSQL as broker.
@@ -193,17 +221,21 @@ class BrokerTaskBackend(TaskBackend):
         table = fq_table("async_operations", schema)
 
         if operation_id:
-            # Update existing operation with task payload
+            # Callers now include task_payload in the same INSERT that creates the
+            # async_operations row (see MemoryEngine._submit_async_operation). The
+            # WHERE clause guards against overwriting that payload — the UPDATE is a
+            # no-op when the row is already claimable, and only fills in a NULL payload
+            # for any legacy caller that still creates the row first.
             await pool.execute(
                 f"""
                 UPDATE {table}
                 SET task_payload = $1::jsonb, updated_at = now()
-                WHERE operation_id = $2
+                WHERE operation_id = $2 AND task_payload IS NULL
                 """,
                 payload_json,
                 operation_id,
             )
-            logger.debug(f"Updated task payload for operation {operation_id}")
+            logger.debug(f"submit_task UPDATE for operation {operation_id} (no-op if payload already set)")
         else:
             # Insert new operation (for tasks without pre-created records)
             # e.g., access_count_update tasks

@@ -29,6 +29,7 @@ from hindsight_api.models import RequestContext
 _ALL_TOOLS: frozenset[str] = frozenset(
     {
         "retain",
+        "sync_retain",
         "recall",
         "reflect",
         "list_banks",
@@ -139,6 +140,7 @@ def build_content_dict(
     metadata: dict[str, str] | None = None,
     document_id: str | None = None,
     strategy: str | None = None,
+    update_mode: str | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """Build a content dict for retain operations.
 
@@ -150,6 +152,7 @@ def build_content_dict(
         metadata: Optional key-value metadata to attach to the memory
         document_id: Optional document ID to associate the memory with
         strategy: Optional named retain strategy override (e.g., 'exact', 'verbose')
+        update_mode: How to handle existing documents ('replace' or 'append')
 
     Returns:
         Tuple of (content_dict, error_message). error_message is None if successful.
@@ -184,6 +187,8 @@ def build_content_dict(
         content_dict["document_id"] = document_id
     if strategy is not None:
         content_dict["strategy"] = strategy
+    if update_mode is not None:
+        content_dict["update_mode"] = update_mode
 
     return content_dict, None
 
@@ -202,6 +207,7 @@ def register_mcp_tools(
     """
     tools_to_register = config.tools or {
         "retain",
+        "sync_retain",
         "recall",
         "reflect",
         "list_banks",
@@ -234,6 +240,9 @@ def register_mcp_tools(
 
     if "retain" in tools_to_register:
         _register_retain(mcp, memory, config)
+
+    if "sync_retain" in tools_to_register:
+        _register_sync_retain(mcp, memory, config)
 
     if "recall" in tools_to_register:
         _register_recall(mcp, memory, config)
@@ -539,6 +548,7 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
             document_id: str | None = None,
             bank_id: str | None = None,
             strategy: str | None = None,
+            update_mode: str | None = None,
         ) -> dict:
             """
             Args:
@@ -550,12 +560,15 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 document_id: Optional document ID to associate this memory with
                 bank_id: Optional bank to store in (defaults to session bank). Use for cross-bank operations.
                 strategy: Optional named retain strategy (e.g., 'exact' for verbatim storage). Strategies are defined in the bank config.
+                update_mode: How to handle existing documents with the same document_id. 'replace' (default) or 'append' (concatenates new content to existing).
             """
             target_bank = bank_id or config.bank_id_resolver()
             if target_bank is None:
                 return {"status": "error", "message": "No bank_id configured"}
 
-            content_dict, error = build_content_dict(content, context, timestamp, tags, metadata, document_id, strategy)
+            content_dict, error = build_content_dict(
+                content, context, timestamp, tags, metadata, document_id, strategy, update_mode
+            )
             if error:
                 return {"status": "error", "message": error}
 
@@ -590,6 +603,7 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
             metadata: dict[str, str] | None = None,
             document_id: str | None = None,
             strategy: str | None = None,
+            update_mode: str | None = None,
         ) -> dict:
             """
             Args:
@@ -600,12 +614,15 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 metadata: Optional key-value metadata to attach (e.g., {'source': 'slack', 'channel': 'general'})
                 document_id: Optional document ID to associate this memory with
                 strategy: Optional named retain strategy (e.g., 'exact' for verbatim storage). Strategies are defined in the bank config.
+                update_mode: How to handle existing documents with the same document_id. 'replace' (default) or 'append' (concatenates new content to existing).
             """
             target_bank = config.bank_id_resolver()
             if target_bank is None:
                 return {"status": "error", "message": "No bank_id configured"}
 
-            content_dict, error = build_content_dict(content, context, timestamp, tags, metadata, document_id, strategy)
+            content_dict, error = build_content_dict(
+                content, context, timestamp, tags, metadata, document_id, strategy, update_mode
+            )
             if error:
                 return {"status": "error", "message": error}
 
@@ -627,6 +644,124 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 return {"status": "error", "message": str(e)}
             except Exception as e:
                 logger.error(f"Error storing memory: {e}", exc_info=True)
+                return {"status": "error", "message": str(e)}
+
+
+def _register_sync_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
+    """Register the sync_retain tool (synchronous retain that waits for completion)."""
+
+    if config.include_bank_id_param:
+
+        @mcp.tool()
+        async def sync_retain(
+            content: str,
+            context: str = "general",
+            timestamp: str | None = None,
+            tags: list[str] | None = None,
+            metadata: dict[str, str] | None = None,
+            document_id: str | None = None,
+            bank_id: str | None = None,
+            strategy: str | None = None,
+        ) -> dict:
+            """Store information to long-term memory and wait for completion.
+
+            Unlike retain (which is asynchronous), this tool blocks until the memory
+            is fully stored and immediately available for recall.
+
+            Args:
+                content: The fact/memory to store (be specific and include relevant details)
+                context: Category for the memory (e.g., 'preferences', 'work', 'hobbies', 'family'). Default: 'general'
+                timestamp: When this event/fact occurred (ISO format, e.g., '2024-01-15T10:30:00Z'). Useful for timeline tracking.
+                tags: Optional tags for scoped visibility filtering (e.g., ['project:alpha', 'user:123'])
+                metadata: Optional key-value metadata to attach (e.g., {'source': 'slack', 'channel': 'general'})
+                document_id: Optional document ID to associate this memory with
+                bank_id: Optional bank to store in (defaults to session bank). Use for cross-bank operations.
+                strategy: Optional named retain strategy (e.g., 'exact' for verbatim storage). Strategies are defined in the bank config.
+            """
+            target_bank = bank_id or config.bank_id_resolver()
+            if target_bank is None:
+                return {"status": "error", "message": "No bank_id configured"}
+
+            content_dict, error = build_content_dict(content, context, timestamp, tags, metadata, document_id, strategy)
+            if error:
+                return {"status": "error", "message": error}
+
+            request_context = _get_request_context(config)
+
+            try:
+                result = await memory.retain_batch_async(
+                    bank_id=target_bank,
+                    contents=[content_dict],
+                    request_context=request_context,
+                    strategy=content_dict.pop("strategy", None),
+                )
+                memory_ids = [uid for batch in result for uid in batch]
+                return {
+                    "status": "completed",
+                    "message": "Memory stored successfully",
+                    "memory_ids": memory_ids,
+                }
+            except OperationValidationError as e:
+                logger.warning(f"Sync retain rejected: {e}")
+                return {"status": "error", "message": str(e)}
+            except Exception as e:
+                logger.error(f"Error in sync retain: {e}", exc_info=True)
+                return {"status": "error", "message": str(e)}
+
+    else:
+
+        @mcp.tool()
+        async def sync_retain(
+            content: str,
+            context: str = "general",
+            timestamp: str | None = None,
+            tags: list[str] | None = None,
+            metadata: dict[str, str] | None = None,
+            document_id: str | None = None,
+            strategy: str | None = None,
+        ) -> dict:
+            """Store information to long-term memory and wait for completion.
+
+            Unlike retain (which is asynchronous), this tool blocks until the memory
+            is fully stored and immediately available for recall.
+
+            Args:
+                content: The fact/memory to store (be specific and include relevant details)
+                context: Category for the memory (e.g., 'preferences', 'work', 'hobbies', 'family'). Default: 'general'
+                timestamp: When this event/fact occurred (ISO format, e.g., '2024-01-15T10:30:00Z'). Useful for timeline tracking.
+                tags: Optional tags for scoped visibility filtering (e.g., ['project:alpha', 'user:123'])
+                metadata: Optional key-value metadata to attach (e.g., {'source': 'slack', 'channel': 'general'})
+                document_id: Optional document ID to associate this memory with
+                strategy: Optional named retain strategy (e.g., 'exact' for verbatim storage). Strategies are defined in the bank config.
+            """
+            target_bank = config.bank_id_resolver()
+            if target_bank is None:
+                return {"status": "error", "message": "No bank_id configured"}
+
+            content_dict, error = build_content_dict(content, context, timestamp, tags, metadata, document_id, strategy)
+            if error:
+                return {"status": "error", "message": error}
+
+            request_context = _get_request_context(config)
+
+            try:
+                result = await memory.retain_batch_async(
+                    bank_id=target_bank,
+                    contents=[content_dict],
+                    request_context=request_context,
+                    strategy=content_dict.pop("strategy", None),
+                )
+                memory_ids = [uid for batch in result for uid in batch]
+                return {
+                    "status": "completed",
+                    "message": "Memory stored successfully",
+                    "memory_ids": memory_ids,
+                }
+            except OperationValidationError as e:
+                logger.warning(f"Sync retain rejected: {e}")
+                return {"status": "error", "message": str(e)}
+            except Exception as e:
+                logger.error(f"Error in sync retain: {e}", exc_info=True)
                 return {"status": "error", "message": str(e)}
 
 
@@ -2719,6 +2854,44 @@ def _register_get_bank_stats(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
             return f'{{"error": "{e}"}}'
 
 
+async def _do_update_bank(
+    memory: MemoryEngine,
+    target_bank: str,
+    request_context: RequestContext,
+    *,
+    name: str | None = None,
+    mission: str | None = None,
+    config_updates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Shared implementation for update_bank MCP tool variants.
+
+    Args:
+        name: Display name (stored in banks table).
+        mission: Deprecated alias for reflect_mission — mapped into config_updates.
+        config_updates: Arbitrary config overrides passed to config_resolver.update_bank_config().
+            Supports all configurable fields (retain_mission, disposition_*, etc.).
+            The config resolver validates keys and rejects non-configurable/credential fields.
+    """
+    # Update display name via engine (stored in DB banks table)
+    if name is not None:
+        await memory.update_bank(
+            target_bank,
+            name=name,
+            request_context=request_context,
+        )
+
+    # Merge deprecated mission alias into config_updates as reflect_mission
+    effective_config: dict[str, Any] = dict(config_updates) if config_updates else {}
+    if mission is not None and "reflect_mission" not in effective_config:
+        effective_config["reflect_mission"] = mission
+
+    if effective_config:
+        await memory._config_resolver.update_bank_config(target_bank, effective_config, request_context)
+
+    # Return updated profile
+    return await memory.get_bank_profile(target_bank, request_context=request_context)
+
+
 def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the update_bank tool."""
 
@@ -2728,16 +2901,37 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
         async def update_bank(
             name: str | None = None,
             mission: str | None = None,
+            config_updates: dict[str, Any] | None = None,
             bank_id: str | None = None,
         ) -> str:
             """
-            Update a memory bank's metadata.
+            Update a memory bank's configuration.
 
-            Changes the name or mission of an existing bank.
+            Updates the bank's name and/or any bank-level configuration fields.
+            Only provided fields will be updated; omitted fields remain unchanged.
 
             Args:
-                name: New human-friendly name for the bank
-                mission: New mission describing who the agent is and what they're trying to accomplish
+                name: Human-friendly display name for the bank.
+                mission: Deprecated alias for config_updates.reflect_mission.
+                config_updates: Dictionary of configuration fields to update. Supports all
+                    bank-configurable fields including:
+                    - reflect_mission: Mission/context for Reflect operations.
+                    - retain_mission: Steers what gets extracted during retain().
+                    - retain_extraction_mode: 'concise' (default), 'verbose', or 'custom'.
+                    - retain_custom_instructions: Custom extraction prompt (active when mode is 'custom').
+                    - retain_chunk_size: Maximum token size for each content chunk.
+                    - retain_chunk_batch_size: Number of chunks to process in parallel.
+                    - enable_observations: Toggle observation consolidation after retain().
+                    - observations_mission: Controls observation synthesis rules.
+                    - disposition_skepticism: Critical evaluation level (1-5).
+                    - disposition_literalism: Literal vs. abstract interpretation (1-5).
+                    - disposition_empathy: Emotional context consideration (1-5).
+                    - entity_labels: Controlled vocabulary for entity classification.
+                    - entities_allow_free_form: Allow labels outside entity_labels.
+                    - recall_include_chunks: Include raw chunks in recall results.
+                    - recall_max_tokens: Max tokens for recall results.
+                    - mcp_enabled_tools: Tool allowlist for this bank.
+                    Any configurable field name is accepted (use Python field names).
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
             try:
@@ -2745,14 +2939,16 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                 if target_bank is None:
                     return '{"error": "No bank_id configured"}'
 
-                result = await memory.update_bank(
+                result = await _do_update_bank(
+                    memory,
                     target_bank,
+                    _get_request_context(config),
                     name=name,
                     mission=mission,
-                    request_context=_get_request_context(config),
+                    config_updates=config_updates,
                 )
                 return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
+            except (OperationValidationError, ValueError) as e:
                 logger.warning(f"Operation rejected: {e}")
                 return json.dumps({"error": str(e)})
             except Exception as e:
@@ -2765,29 +2961,52 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
         async def update_bank(
             name: str | None = None,
             mission: str | None = None,
+            config_updates: dict[str, Any] | None = None,
         ) -> dict:
             """
-            Update this memory bank's metadata.
+            Update this memory bank's configuration.
 
-            Changes the name or mission of the bank.
+            Updates the bank's name and/or any bank-level configuration fields.
+            Only provided fields will be updated; omitted fields remain unchanged.
 
             Args:
-                name: New human-friendly name for the bank
-                mission: New mission describing who the agent is and what they're trying to accomplish
+                name: Human-friendly display name for the bank.
+                mission: Deprecated alias for config_updates.reflect_mission.
+                config_updates: Dictionary of configuration fields to update. Supports all
+                    bank-configurable fields including:
+                    - reflect_mission: Mission/context for Reflect operations.
+                    - retain_mission: Steers what gets extracted during retain().
+                    - retain_extraction_mode: 'concise' (default), 'verbose', or 'custom'.
+                    - retain_custom_instructions: Custom extraction prompt (active when mode is 'custom').
+                    - retain_chunk_size: Maximum token size for each content chunk.
+                    - retain_chunk_batch_size: Number of chunks to process in parallel.
+                    - enable_observations: Toggle observation consolidation after retain().
+                    - observations_mission: Controls observation synthesis rules.
+                    - disposition_skepticism: Critical evaluation level (1-5).
+                    - disposition_literalism: Literal vs. abstract interpretation (1-5).
+                    - disposition_empathy: Emotional context consideration (1-5).
+                    - entity_labels: Controlled vocabulary for entity classification.
+                    - entities_allow_free_form: Allow labels outside entity_labels.
+                    - recall_include_chunks: Include raw chunks in recall results.
+                    - recall_max_tokens: Max tokens for recall results.
+                    - mcp_enabled_tools: Tool allowlist for this bank.
+                    Any configurable field name is accepted (use Python field names).
             """
             try:
                 target_bank = config.bank_id_resolver()
                 if target_bank is None:
                     return {"error": "No bank_id configured"}
 
-                result = await memory.update_bank(
+                result = await _do_update_bank(
+                    memory,
                     target_bank,
+                    _get_request_context(config),
                     name=name,
                     mission=mission,
-                    request_context=_get_request_context(config),
+                    config_updates=config_updates,
                 )
                 return result
-            except OperationValidationError as e:
+            except (OperationValidationError, ValueError) as e:
                 logger.warning(f"Operation rejected: {e}")
                 return {"error": str(e)}
             except Exception as e:

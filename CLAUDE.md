@@ -68,8 +68,9 @@ cd hindsight-control-plane && npm run dev
 ./scripts/benchmarks/run-locomo.sh
 
 # Performance benchmarks
+./scripts/benchmarks/run-perf-test.sh                      # System perf (mock LLM + pg0)
+./scripts/benchmarks/run-perf-test.sh --scale tiny          # Quick smoke test
 ./scripts/benchmarks/run-consolidation.sh
-./scripts/benchmarks/run-retain-perf.sh --document <path>  # Requires API server running
 
 # Results viewer
 ./scripts/benchmarks/start-visualizer.sh  # View results at localhost:8001
@@ -221,6 +222,10 @@ Every new integration in `hindsight-integrations/` must satisfy all of the follo
 4. **Follow project code standards** — Python style, type safety, no raw dicts for structured data, no multi-item tuple returns (see `.claude/skills/code-review/SKILL.md`).
 
 If any of these are missing, the integration is incomplete and must not be pushed or merged.
+
+### Changelogs
+
+Never add "Unreleased" entries to changelogs (e.g. `hindsight-docs/src/pages/changelog/**`). Changelog entries are written by the release script (`./scripts/release-integration.sh`) when a version is actually cut. If a bug fix or feature needs documenting before release, describe it in the PR/commit — the release tooling will surface it in the published changelog section.
 
 ### Adding New API Configuration Flags
 

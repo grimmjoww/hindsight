@@ -7,6 +7,7 @@ Handles insertion of facts into the database.
 import json
 import logging
 import uuid
+from datetime import datetime
 
 from ...config import get_config
 from ..memory_engine import fq_table
@@ -15,6 +16,23 @@ from .fact_extraction import _sanitize_text
 from .types import ProcessedFact
 
 logger = logging.getLogger(__name__)
+
+
+async def get_document_content(
+    conn,
+    bank_id: str,
+    document_id: str,
+) -> str | None:
+    """Fetch the original_text of an existing document.
+
+    Returns None if the document does not exist.
+    """
+    row = await conn.fetchval(
+        f"SELECT original_text FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
+        document_id,
+        bank_id,
+    )
+    return row
 
 
 async def insert_facts_batch(
@@ -207,6 +225,85 @@ async def ensure_bank_exists(conn, bank_id: str) -> None:
         await create_bank_vector_indexes(conn, bank_id, str(internal_id))
 
 
+async def delete_stale_observations_for_memories(
+    conn,
+    bank_id: str,
+    fact_ids: "list[str | uuid.UUID]",
+) -> int:
+    """Delete observations whose source memories are about to be removed.
+
+    Mirrors the cleanup performed by ``MemoryEngine.delete_document`` so that
+    every code path that removes ``memory_units`` also removes the
+    observations derived from them. Without this, ingesting a fresh version
+    of a document via the retain pipeline (which does a full-replace
+    ``DELETE FROM documents`` cascade) used to leave orphan observations
+    pointing at memory IDs that no longer existed.
+
+    For each observation referencing any of ``fact_ids``:
+    1. Delete the observation row (its text is stale once even one source
+       memory disappears).
+    2. Reset ``consolidated_at = NULL`` on the surviving source memories so
+       they get re-consolidated under fresh observations on the next run.
+
+    Must be called within an active transaction, before the source memories
+    are deleted.
+
+    Returns the number of observations deleted.
+    """
+    if not fact_ids:
+        return 0
+
+    fact_uuids = [uuid.UUID(str(fid)) if not isinstance(fid, uuid.UUID) else fid for fid in fact_ids]
+
+    affected_obs = await conn.fetch(
+        f"""
+        SELECT id, source_memory_ids
+        FROM {fq_table("memory_units")}
+        WHERE bank_id = $1
+          AND fact_type = 'observation'
+          AND source_memory_ids && $2::uuid[]
+        """,
+        bank_id,
+        fact_uuids,
+    )
+
+    if not affected_obs:
+        return 0
+
+    deleted_set = {str(uid) for uid in fact_uuids}
+    obs_ids = [obs["id"] for obs in affected_obs]
+    seen_remaining: set[str] = set()
+    remaining_source_ids: list[uuid.UUID] = []
+    for obs in affected_obs:
+        for src_id in obs["source_memory_ids"] or []:
+            src_str = str(src_id)
+            if src_str not in deleted_set and src_str not in seen_remaining:
+                remaining_source_ids.append(src_id)
+                seen_remaining.add(src_str)
+
+    await conn.execute(
+        f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
+        obs_ids,
+    )
+
+    if remaining_source_ids:
+        await conn.execute(
+            f"""
+            UPDATE {fq_table("memory_units")}
+            SET consolidated_at = NULL
+            WHERE id = ANY($1::uuid[])
+              AND fact_type IN ('experience', 'world')
+            """,
+            remaining_source_ids,
+        )
+
+    logger.info(
+        f"[OBSERVATIONS] Deleted {len(obs_ids)} observations, reset {len(remaining_source_ids)} "
+        f"source memories for re-consolidation in bank {bank_id}"
+    )
+    return len(obs_ids)
+
+
 async def handle_document_tracking(
     conn,
     bank_id: str,
@@ -237,17 +334,58 @@ async def handle_document_tracking(
     combined_content = _sanitize_text(combined_content) or ""
     content_hash = hashlib.sha256(combined_content.encode()).hexdigest()
 
-    # Delete old document first (cascades to units and links)
-    # Only delete on the first batch to avoid deleting data we just inserted
+    # Delete old document first (cascades to units and links).
+    # Only delete on the first batch to avoid deleting data we just inserted.
+    # Before the cascade, fan out to delete observations derived from the
+    # outgoing memory_units — otherwise the FK ON DELETE CASCADE removes the
+    # source memory_units but leaves observation rows pointing at IDs that
+    # no longer exist (consolidated_at on co-source memories also stays
+    # frozen). Same cleanup the explicit ``delete_document`` API performs.
+    preserved_created_at = None
     if is_first_batch:
-        await conn.fetchval(
-            f"DELETE FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 RETURNING id",
+        existing_unit_rows = await conn.fetch(
+            f"""
+            SELECT id FROM {fq_table("memory_units")}
+            WHERE document_id = $1 AND fact_type IN ('experience', 'world')
+            """,
+            document_id,
+        )
+        existing_unit_ids = [row["id"] for row in existing_unit_rows]
+        if existing_unit_ids:
+            invalidated = await delete_stale_observations_for_memories(conn, bank_id, existing_unit_ids)
+            if invalidated:
+                logger.info(
+                    f"[RETAIN] Document {document_id} re-ingested: invalidated "
+                    f"{invalidated} observation(s) derived from {len(existing_unit_ids)} outgoing memory_units"
+                )
+        # Explicitly delete memory_units by document_id BEFORE deleting the
+        # document row. The CASCADE from documents→chunks→memory_units only
+        # catches units that have a non-NULL chunk_id FK. Units with chunk_id=NULL
+        # (e.g. from partial writes or edge cases) would survive the cascade.
+        # This explicit delete ensures complete cleanup.
+        await conn.execute(
+            f"DELETE FROM {fq_table('memory_units')} WHERE document_id = $1 AND bank_id = $2",
+            document_id,
+            bank_id,
+        )
+        # Capture created_at before deletion so re-ingestion preserves it.
+        preserved_created_at = await conn.fetchval(
+            f"DELETE FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 RETURNING created_at",
             document_id,
             bank_id,
         )
 
     # Insert document (or update if exists from concurrent operations)
-    await _upsert_document_row(conn, bank_id, document_id, combined_content, content_hash, retain_params, document_tags)
+    await _upsert_document_row(
+        conn,
+        bank_id,
+        document_id,
+        combined_content,
+        content_hash,
+        retain_params,
+        document_tags,
+        preserved_created_at=preserved_created_at,
+    )
 
 
 async def upsert_document_metadata(
@@ -280,12 +418,19 @@ async def _upsert_document_row(
     content_hash: str,
     retain_params: dict | None = None,
     document_tags: list[str] | None = None,
+    preserved_created_at: datetime | None = None,
 ) -> None:
-    """Insert or update a document row."""
+    """Insert or update a document row.
+
+    When ``preserved_created_at`` is provided, it is used for ``created_at`` on
+    INSERT so that re-ingesting a document (which deletes + inserts the row)
+    keeps the original creation timestamp. ``updated_at`` is always set to
+    ``NOW()`` on both INSERT and the ON CONFLICT UPDATE branch.
+    """
     await conn.execute(
         f"""
-        INSERT INTO {fq_table("documents")} (id, bank_id, original_text, content_hash, retain_params, tags)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO {fq_table("documents")} (id, bank_id, original_text, content_hash, retain_params, tags, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), NOW())
         ON CONFLICT (id, bank_id) DO UPDATE
         SET original_text = EXCLUDED.original_text,
             content_hash = EXCLUDED.content_hash,
@@ -299,6 +444,7 @@ async def _upsert_document_row(
         content_hash,
         json.dumps(retain_params) if retain_params else None,
         document_tags or [],
+        preserved_created_at,
     )
 
 

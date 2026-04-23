@@ -27,6 +27,10 @@ import statistics
 import time
 from typing import Any
 
+# Capture DB URL early before hindsight_api imports trigger dotenv override
+# (config.py uses load_dotenv(override=True) which stomps env vars)
+_EARLY_DB_URL = os.environ.get("HINDSIGHT_API_DATABASE_URL")
+
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
@@ -546,7 +550,7 @@ def _build_engine(*, disable_observations: bool = False) -> "Any":
     """Create a MemoryEngine using mock LLM and DB from env."""
     from hindsight_api import MemoryEngine
 
-    db_url = os.getenv("HINDSIGHT_API_DATABASE_URL", "pg0")
+    db_url = _EARLY_DB_URL or os.getenv("HINDSIGHT_API_DATABASE_URL", "pg0")
     if disable_observations:
         os.environ["HINDSIGHT_API_ENABLE_OBSERVATIONS"] = "false"
     engine = MemoryEngine(
@@ -725,7 +729,7 @@ async def cmd_generate(bank_id: str, scale: str, workers: int = 16, with_observa
         executor=engine.execute_task,
         poll_interval_ms=200,
         max_slots=workers,
-        consolidation_max_slots=0,
+        slot_reservations={},
     )
     poller_task = asyncio.create_task(poller.run())
     console.print("  Worker     : started\n")
@@ -774,6 +778,12 @@ async def cmd_generate(bank_id: str, scale: str, workers: int = 16, with_observa
 # ---------------------------------------------------------------------------
 
 
+class _RRFCrossEncoder:
+    """Stub cross encoder that reports itself as the RRF passthrough provider."""
+
+    provider_name = "rrf"
+
+
 class _RRFReranker:
     """
     Drop-in replacement for CrossEncoderReranker that uses RRF scores only.
@@ -781,6 +791,8 @@ class _RRFReranker:
     Eliminates cross-encoder (CPU-bound ML inference) so recall timings
     reflect pure DB interaction costs.
     """
+
+    cross_encoder = _RRFCrossEncoder()
 
     async def ensure_initialized(self) -> None:
         pass

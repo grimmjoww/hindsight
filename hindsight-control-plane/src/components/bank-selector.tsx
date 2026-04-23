@@ -4,6 +4,7 @@ import * as React from "react";
 import { Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useBank } from "@/lib/bank-context";
+import { bankRoute } from "@/lib/bank-url";
 import { client } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -176,7 +177,7 @@ function BankSelectorInner() {
       setTemplateError(null);
       // Navigate to the new bank
       setCurrentBank(newBankId.trim());
-      router.push(`/banks/${newBankId.trim()}?view=data`);
+      router.push(bankRoute(newBankId.trim(), "?view=data"));
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : "Failed to create bank");
     } finally {
@@ -236,10 +237,10 @@ function BankSelectorInner() {
     return result;
   };
 
-  const emptyFileMeta = () => ({
+  const emptyFileMeta = (documentId = "") => ({
     context: "",
     timestamp: "",
-    document_id: "",
+    document_id: documentId,
     tags: "",
     metadata: "",
     strategy: "",
@@ -250,7 +251,7 @@ function BankSelectorInner() {
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
     setSelectedFiles((prev) => [...prev, ...files]);
-    setFilesMetadata((prev) => [...prev, ...files.map(emptyFileMeta)]);
+    setFilesMetadata((prev) => [...prev, ...files.map((f) => emptyFileMeta(f.name))]);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -321,7 +322,7 @@ function BankSelectorInner() {
       setUploadProgress("");
 
       // Navigate to documents view
-      router.push(`/banks/${currentBank}?view=documents`);
+      router.push(bankRoute(currentBank!, "?view=documents"));
     } catch {
       // Error toast is shown automatically by the API client interceptor
     } finally {
@@ -402,7 +403,7 @@ function BankSelectorInner() {
       setDocStrategy("");
 
       // Navigate to documents view to see the new document
-      router.push(`/banks/${currentBank}?view=documents`);
+      router.push(bankRoute(currentBank!, "?view=documents"));
     } catch {
       // Error toast is shown automatically by the API client interceptor
     } finally {
@@ -464,7 +465,7 @@ function BankSelectorInner() {
                         const queryString = subTab
                           ? `?view=${view}&subTab=${subTab}`
                           : `?view=${view}`;
-                        router.push(`/banks/${value}${queryString}`);
+                        router.push(bankRoute(value, queryString));
                       }}
                     >
                       <Check

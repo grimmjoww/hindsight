@@ -214,6 +214,11 @@ def main():
     # Check for uvloop/winloop availability
     import sys
 
+    loop_impl = "asyncio"
+    if sys.platform == "win32":
+        try:
+            import winloop
+
             winloop.install()  # Patches asyncio globally — uvicorn uses "asyncio" but gets winloop
             loop_impl = "asyncio"  # Tell uvicorn "asyncio" — it's now winloop underneath
             print("winloop installed as asyncio event loop policy (Windows uvloop port)")
@@ -222,10 +227,7 @@ def main():
     else:
         try:
             import uvloop  # noqa: F401
-<<<<<<< HEAD
-=======
 
->>>>>>> upstream/main
             loop_impl = "uvloop"
             print("uvloop available, will use for event loop")
         except ImportError:
